@@ -1,15 +1,58 @@
 """Tests for MCP server functionality."""
 
+# ruff: noqa: E402
+
 import json
+import re
 import tempfile
+from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("mcp")  # Skip if mcp extra not installed
+from tests.optional_dep_stubs import ensure_fake_mcp
 
-from sidemantic.mcp_server import create_chart, get_models, initialize_layer, list_models, run_query
+ensure_fake_mcp()
+
+from sidemantic import Dimension, Metric, Model, SemanticLayer
+from sidemantic.core.pre_aggregation import PreAggregation
+from sidemantic.core.relationship import Relationship
+from sidemantic.core.semantic_layer import PreaggregationStrictError
+from sidemantic.mcp_server import (
+    SIDEMANTIC_MCP_INSTRUCTIONS,
+    _convert_to_json_compatible,
+    _format_join_condition,
+    catalog_resource,
+    create_chart,
+    explain_metric,
+    get_models,
+    get_semantic_graph,
+    initialize_layer,
+    run_query,
+    run_sql,
+    search_semantic_catalog,
+    validate_query,
+)
+
+
+@pytest.fixture
+def stub_chart_rendering(monkeypatch):
+    import sidemantic.mcp_server as mcp_mod
+
+    def fake_make_chart(data, chart_type="auto", title=None, width=600, height=400):
+        return {
+            "mark": "bar" if chart_type == "auto" else chart_type,
+            "title": title,
+            "width": width,
+            "height": height,
+            "data": {"values": data},
+        }
+
+    monkeypatch.setattr("sidemantic.charts.create_chart", fake_make_chart)
+    monkeypatch.setattr("sidemantic.charts.chart_to_vega", lambda chart: chart)
+    monkeypatch.setattr("sidemantic.charts.chart_to_base64_png", lambda _chart: "data:image/png;base64,ZmFrZQ==")
+    monkeypatch.setattr(mcp_mod, "_apps_enabled", False)
 
 
 @pytest.fixture
@@ -19,11 +62,12 @@ def demo_layer():
     tmpdir = tempfile.mkdtemp()
     tmpdir_path = Path(tmpdir)
 
-    # Create a simple model file
+    # Create a model file with segments and a second model
     model_yaml = """
 models:
   - name: orders
     table: orders_table
+    description: "All customer orders"
     dimensions:
       - name: order_id
         sql: order_id
@@ -35,13 +79,24 @@ models:
         sql: order_date
         type: time
         granularity: day
+      - name: status
+        sql: status
+        type: categorical
     metrics:
       - name: total_revenue
         agg: sum
         sql: amount
+        description: "Total revenue from orders"
       - name: order_count
         agg: count_distinct
         sql: order_id
+    segments:
+      - name: completed_orders
+        sql: "{model}.status = 'completed'"
+        description: "Only completed orders"
+      - name: high_value
+        sql: "{model}.amount > 100"
+        description: "Orders over 100"
 """
     model_file = tmpdir_path / "orders.yml"
     model_file.write_text(model_yaml)
@@ -56,14 +111,15 @@ models:
             order_id VARCHAR,
             customer_name VARCHAR,
             order_date DATE,
-            amount DECIMAL
+            amount DECIMAL,
+            status VARCHAR
         )
     """)
     layer.adapter.execute("""
         INSERT INTO orders_table VALUES
-            (1, '1', 'Alice', '2024-01-01', 100),
-            (2, '2', 'Bob', '2024-01-02', 200),
-            (3, '3', 'Alice', '2024-01-03', 150)
+            (1, '1', 'Alice', '2024-01-01', 100, 'completed'),
+            (2, '2', 'Bob', '2024-01-02', 200, 'completed'),
+            (3, '3', 'Alice', '2024-01-03', 150, 'pending')
     """)
 
     yield layer
@@ -74,25 +130,28 @@ models:
     shutil.rmtree(tmpdir)
 
 
-def test_list_models(demo_layer):
-    """Test listing all models."""
-    models = list_models()
+def test_discover_models_via_semantic_graph(demo_layer):
+    """Test discovering models via get_semantic_graph (replaces list_models)."""
+    graph = get_semantic_graph()
+    models = graph["models"]
 
     assert len(models) == 1
     assert models[0]["name"] == "orders"
     assert models[0]["table"] == "orders_table"
-    assert len(models[0]["dimensions"]) == 3
+    assert len(models[0]["dimensions"]) == 4
     assert len(models[0]["metrics"]) == 2
     assert "order_id" in models[0]["dimensions"]
     assert "customer_name" in models[0]["dimensions"]
     assert "order_date" in models[0]["dimensions"]
+    assert "status" in models[0]["dimensions"]
     assert "total_revenue" in models[0]["metrics"]
     assert "order_count" in models[0]["metrics"]
 
 
 def test_get_models(demo_layer):
     """Test getting detailed model information."""
-    models = get_models(["orders"])
+    result = get_models(["orders"])
+    models = result["models"]
 
     assert len(models) == 1
     model = models[0]
@@ -100,11 +159,12 @@ def test_get_models(demo_layer):
     assert model["table"] == "orders_table"
 
     # Check dimensions
-    assert len(model["dimensions"]) == 3
+    assert len(model["dimensions"]) == 4
     dim_names = [d["name"] for d in model["dimensions"]]
     assert "order_id" in dim_names
     assert "customer_name" in dim_names
     assert "order_date" in dim_names
+    assert "status" in dim_names
 
     # Check metrics
     assert len(model["metrics"]) == 2
@@ -120,15 +180,15 @@ def test_get_models(demo_layer):
 
 def test_get_models_nonexistent(demo_layer):
     """Test getting a model that doesn't exist."""
-    models = get_models(["nonexistent"])
-    assert len(models) == 0
+    result = get_models(["nonexistent"])
+    assert len(result["models"]) == 0
 
 
 def test_get_models_multiple(demo_layer):
     """Test getting multiple models (only one exists)."""
-    models = get_models(["orders", "nonexistent"])
-    assert len(models) == 1
-    assert models[0]["name"] == "orders"
+    result = get_models(["orders", "nonexistent"])
+    assert len(result["models"]) == 1
+    assert result["models"][0]["name"] == "orders"
 
 
 def test_run_query_basic(demo_layer):
@@ -144,6 +204,9 @@ def test_run_query_basic(demo_layer):
     assert "SUM" in result["sql"].upper()
     # Should have 2 rows (Alice and Bob)
     assert result["row_count"] == 2
+    assert result["timing"]["compile_ms"] >= 0
+    assert result["timing"]["execution_ms"] >= 0
+    assert result["timing"]["total_ms"] >= 0
     assert len(result["rows"]) == 2
 
 
@@ -158,6 +221,47 @@ def test_run_query_with_filter(demo_layer):
     assert result["sql"] is not None
     assert "WHERE" in result["sql"].upper()
     assert "Alice" in result["sql"]
+
+
+def test_run_query_base_time_filter_uses_raw_expression(demo_layer):
+    result = run_query(
+        metrics=["orders.total_revenue"],
+        where="orders.order_date >= TIMESTAMP '2024-01-02 12:34:56'",
+        dry_run=True,
+    )
+
+    where_clause = result["sql"].split("WHERE", 1)[1].split(")\nSELECT", 1)[0]
+    assert re.search(r"order_date\s*>=", where_clause)
+    assert "DATE_TRUNC" not in where_clause.upper()
+
+
+def test_run_query_explicit_time_grain_filter_truncates_expression(demo_layer):
+    demo_layer.conn.execute("ALTER TABLE orders_table ALTER COLUMN order_date TYPE TIMESTAMP")
+    demo_layer.conn.execute(
+        "INSERT INTO orders_table VALUES (99, '99', 'Midday', '2024-01-02 12:00:00', 999, 'completed')"
+    )
+    result = run_query(
+        metrics=["orders.total_revenue"],
+        where="orders.order_date__day > DATE '2024-01-02'",
+        dry_run=True,
+    )
+
+    expected = demo_layer.conn.execute(
+        "SELECT SUM(amount) FROM orders_table WHERE DATE_TRUNC('day', order_date) > DATE '2024-01-02'"
+    ).fetchall()
+    assert demo_layer.conn.execute(result["sql"]).fetchall() == expected
+
+
+def test_run_query_freezes_current_timestamp_for_partition_pruning(demo_layer):
+    result = run_query(
+        metrics=["orders.total_revenue"],
+        where="orders.order_date >= current_timestamp - interval '24 hours'",
+        dry_run=True,
+    )
+
+    sql = result["sql"].upper()
+    assert "CURRENT_TIMESTAMP" not in sql
+    assert re.search(r"CAST\('.*\+00:00' AS TIMESTAMPTZ\) - INTERVAL '24' HOURS", sql)
 
 
 def test_run_query_with_order_by(demo_layer):
@@ -207,6 +311,45 @@ def test_run_query_metrics_only(demo_layer):
     assert "COUNT" in result["sql"].upper()
 
 
+def _unbuilt_rollup_layer(*, strict: bool = False) -> SemanticLayer:
+    layer = SemanticLayer(auto_register=False, use_preaggregations=True, preagg_strict=strict)
+    layer.adapter.execute("create table orders (id integer, status varchar, amount double)")
+    layer.adapter.execute(
+        "insert into orders values (1, 'completed', 10.0), (2, 'completed', 20.0), (3, 'pending', 5.0)"
+    )
+    layer.add_model(
+        Model(
+            name="orders",
+            table="orders",
+            primary_key="id",
+            dimensions=[Dimension(name="status", sql="status", type="categorical")],
+            metrics=[Metric(name="revenue", agg="sum", sql="amount")],
+            pre_aggregations=[PreAggregation(name="by_status", measures=["revenue"], dimensions=["status"])],
+        )
+    )
+    return layer
+
+
+def test_run_query_falls_back_when_rollup_is_missing(monkeypatch):
+    import sidemantic.mcp_server as mcp_server
+
+    monkeypatch.setattr(mcp_server, "_layer", _unbuilt_rollup_layer())
+
+    result = run_query(metrics=["orders.revenue"], dimensions=["orders.status"])
+
+    rows = sorted((row["status"], row["revenue"]) for row in result["rows"])
+    assert rows == [("completed", 30.0), ("pending", 5.0)]
+
+
+def test_run_query_strict_mode_rejects_missing_rollup(monkeypatch):
+    import sidemantic.mcp_server as mcp_server
+
+    monkeypatch.setattr(mcp_server, "_layer", _unbuilt_rollup_layer(strict=True))
+
+    with pytest.raises(PreaggregationStrictError, match="not built"):
+        run_query(metrics=["orders.revenue"], dimensions=["orders.status"])
+
+
 def test_run_query_decimal_conversion(demo_layer):
     """Test that Decimal values are converted to float for JSON serialization."""
     result = run_query(
@@ -233,7 +376,7 @@ def test_run_query_decimal_conversion(demo_layer):
         pytest.fail(f"Result is not JSON serializable: {e}")
 
 
-def test_create_chart_basic(demo_layer):
+def test_create_chart_basic(demo_layer, stub_chart_rendering):
     """Test creating a basic chart."""
     result = create_chart(
         dimensions=["orders.customer_name"],
@@ -263,7 +406,7 @@ def test_create_chart_basic(demo_layer):
     assert result["row_count"] == 2  # Alice and Bob
 
 
-def test_create_chart_decimal_conversion(demo_layer):
+def test_create_chart_decimal_conversion(demo_layer, stub_chart_rendering):
     """Test that create_chart converts Decimals to floats for JSON serialization."""
     result = create_chart(
         dimensions=["orders.customer_name"],
@@ -287,7 +430,7 @@ def test_create_chart_decimal_conversion(demo_layer):
         pytest.fail(f"create_chart result is not JSON serializable: {e}")
 
 
-def test_create_chart_with_filter(demo_layer):
+def test_create_chart_with_filter(demo_layer, stub_chart_rendering):
     """Test creating a chart with a filter."""
     result = create_chart(
         dimensions=["orders.customer_name"],
@@ -301,7 +444,7 @@ def test_create_chart_with_filter(demo_layer):
     assert "Alice" in result["sql"]
 
 
-def test_create_chart_time_series(demo_layer):
+def test_create_chart_time_series(demo_layer, stub_chart_rendering):
     """Test creating a time series chart."""
     result = create_chart(
         dimensions=["orders.order_date"],
@@ -318,3 +461,691 @@ def test_create_chart_time_series(demo_layer):
         json.dumps(result)
     except TypeError as e:
         pytest.fail(f"Time series chart result is not JSON serializable: {e}")
+
+
+# --- Tests for new tools ---
+
+
+def test_run_query_dry_run(demo_layer):
+    """Test run_query with dry_run returns SQL without executing."""
+    result = run_query(
+        dimensions=["orders.customer_name"],
+        metrics=["orders.total_revenue"],
+        limit=5,
+        dry_run=True,
+    )
+
+    assert "sql" in result
+    assert "SELECT" in result["sql"].upper()
+    assert "SUM" in result["sql"].upper()
+    assert "LIMIT" in result["sql"].upper()
+    # Should NOT have rows or row_count
+    assert "rows" not in result
+    assert result["timing"]["compile_ms"] >= 0
+    assert "row_count" not in result
+
+
+def test_run_query_dry_run_with_offset(demo_layer):
+    """Test run_query dry_run with offset for pagination."""
+    result = run_query(
+        dimensions=["orders.customer_name"],
+        metrics=["orders.total_revenue"],
+        limit=10,
+        offset=20,
+        dry_run=True,
+    )
+
+    assert "sql" in result
+    assert "OFFSET" in result["sql"].upper()
+
+
+def test_run_sql_simple(demo_layer):
+    """Test run_sql with a simple semantic query."""
+    result = run_sql("SELECT total_revenue, customer_name FROM orders")
+
+    assert "sql" in result
+    assert "original_sql" in result
+    assert "rows" in result
+    assert "row_count" in result
+    assert result["row_count"] == 2  # Alice and Bob
+    assert result["original_sql"] == "SELECT total_revenue, customer_name FROM orders"
+
+
+def test_run_sql_with_filter(demo_layer):
+    """Test run_sql with WHERE clause."""
+    result = run_sql("SELECT total_revenue, customer_name FROM orders WHERE customer_name = 'Alice'")
+
+    assert result["row_count"] == 1
+    assert "WHERE" in result["sql"].upper()
+
+
+def test_run_sql_with_time_granularity(demo_layer):
+    """Test run_sql with time granularity suffix."""
+    result = run_sql("SELECT order_date__month, total_revenue FROM orders")
+
+    assert result["row_count"] > 0
+    assert "DATE_TRUNC" in result["sql"].upper()
+
+
+def test_validate_query_valid(demo_layer):
+    """Test validate_query with valid references."""
+    result = validate_query(
+        dimensions=["orders.customer_name"],
+        metrics=["orders.total_revenue"],
+    )
+
+    assert result["valid"] is True
+    assert result["errors"] == []
+
+
+def test_validate_query_invalid_model(demo_layer):
+    """Test validate_query with nonexistent model."""
+    result = validate_query(
+        dimensions=["nonexistent.foo"],
+        metrics=["orders.total_revenue"],
+    )
+
+    assert result["valid"] is False
+    assert len(result["errors"]) > 0
+    assert any("nonexistent" in e for e in result["errors"])
+
+
+def test_validate_query_invalid_dimension(demo_layer):
+    """Test validate_query with nonexistent dimension."""
+    result = validate_query(
+        dimensions=["orders.nonexistent_dim"],
+        metrics=["orders.total_revenue"],
+    )
+
+    assert result["valid"] is False
+    assert len(result["errors"]) > 0
+
+
+def test_validate_query_invalid_metric(demo_layer):
+    """Test validate_query with nonexistent metric."""
+    result = validate_query(
+        dimensions=["orders.customer_name"],
+        metrics=["orders.nonexistent_metric"],
+    )
+
+    assert result["valid"] is False
+    assert len(result["errors"]) > 0
+
+
+def test_validate_query_rejects_multiple_cohort_metrics(demo_layer):
+    orders = demo_layer.graph.models["orders"]
+    orders.metrics.extend(
+        [
+            Metric(
+                name="repeat_customers",
+                type="cohort",
+                entity="customer_name",
+                inner_metrics=[{"name": "orders", "agg": "count"}],
+                having="orders >= 2",
+                agg="count",
+            ),
+            Metric(
+                name="cross_channel_customers",
+                type="cohort",
+                entity="customer_name",
+                inner_metrics=[{"name": "orders", "agg": "count"}],
+                having="orders >= 2",
+                agg="count",
+            ),
+        ]
+    )
+
+    result = validate_query(
+        metrics=["orders.repeat_customers", "orders.cross_channel_customers"],
+    )
+
+    assert result["valid"] is False
+    assert any("Only one cohort metric" in error for error in result["errors"])
+
+
+def test_segments_via_get_models(demo_layer):
+    """Test that segments are accessible via get_models (replaces list_segments)."""
+    result = get_models(["orders"])
+    model = result["models"][0]
+
+    assert "segments" in model
+    assert len(model["segments"]) == 2
+
+    seg_names = [s["name"] for s in model["segments"]]
+    assert "completed_orders" in seg_names
+    assert "high_value" in seg_names
+
+    completed = next(s for s in model["segments"] if s["name"] == "completed_orders")
+    assert "sql" in completed
+    assert "description" in completed
+
+
+def test_get_semantic_graph(demo_layer):
+    """Test get_semantic_graph returns full graph overview."""
+    result = get_semantic_graph()
+
+    assert "models" in result
+    assert "joinable_pairs" in result
+    assert len(result["models"]) == 1
+
+    model = result["models"][0]
+    assert model["name"] == "orders"
+    assert "dimensions" in model
+    assert "metrics" in model
+    assert "segments" in model
+    assert "completed_orders" in model["segments"]
+    assert "primary_key" not in model
+
+
+def test_mcp_instructions_promote_semantic_first_analysis():
+    assert "authoritative semantic layer" in SIDEMANTIC_MCP_INSTRUCTIONS
+    assert "search_semantic_catalog" in SIDEMANTIC_MCP_INSTRUCTIONS
+    assert "explain_metric" in SIDEMANTIC_MCP_INSTRUCTIONS
+    assert "semantic_gap" in SIDEMANTIC_MCP_INSTRUCTIONS
+
+
+def test_search_semantic_catalog_ranks_and_filters_results(demo_layer):
+    result = search_semantic_catalog("orders.total_revenue", kinds=["metric"])
+
+    assert result["result_count"] == 1
+    assert result["results"][0]["kind"] == "metric"
+    assert result["results"][0]["qualified_name"] == "orders.total_revenue"
+
+
+def test_search_semantic_catalog_searches_descriptions_and_limits(demo_layer):
+    result = search_semantic_catalog("orders", limit=2)
+
+    assert result["result_count"] == 2
+    assert result["total_matches"] > result["result_count"]
+    assert result["truncated"] is True
+
+
+def test_search_semantic_catalog_ranks_partial_matches_for_broad_queries(demo_layer):
+    result = search_semantic_catalog("revenue status customer retention")
+
+    assert result["results"]
+    assert any(item["qualified_name"] == "orders.total_revenue" for item in result["results"])
+    revenue = next(item for item in result["results"] if item["qualified_name"] == "orders.total_revenue")
+    assert "revenue" in revenue["matched_tokens"]
+
+
+def test_search_semantic_catalog_matches_token_prefixes_not_internal_substrings(demo_layer):
+    orders = demo_layer.graph.models["orders"]
+    orders.dimensions.extend(
+        [
+            Dimension(name="longitude", sql="longitude", type="numeric"),
+            Dimension(name="github_repository", sql="github_repository", type="categorical"),
+        ]
+    )
+
+    result = search_semantic_catalog("git", kinds=["dimension"])
+
+    assert "orders.github_repository" in [item["qualified_name"] for item in result["results"]]
+    assert "orders.longitude" not in [item["qualified_name"] for item in result["results"]]
+
+
+def test_search_semantic_catalog_deduplicates_model_registered_graph_metrics(demo_layer):
+    orders = demo_layer.graph.models["orders"]
+    metric = orders.metrics[0]
+    demo_layer.graph.metrics[metric.name] = metric
+
+    result = search_semantic_catalog(metric.name, kinds=["metric"])
+
+    assert [item["qualified_name"] for item in result["results"]].count(f"orders.{metric.name}") == 1
+    assert metric.name not in [item["qualified_name"] for item in result["results"]]
+
+
+def test_search_semantic_catalog_rejects_invalid_input(demo_layer):
+    with pytest.raises(ValueError, match="non-whitespace"):
+        search_semantic_catalog("  ")
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        search_semantic_catalog("revenue", limit=0)
+
+
+def test_search_semantic_catalog_respects_field_visibility(demo_layer):
+    orders = demo_layer.graph.models["orders"]
+    orders.dimensions.append(Dimension(name="secret_note", sql="secret_note", type="categorical", public=False))
+    demo_layer.enforce_visibility = True
+
+    result = search_semantic_catalog("secret note")
+
+    assert result["results"] == []
+
+
+def test_explain_metric_returns_definition_and_provenance(demo_layer):
+    result = explain_metric("orders.total_revenue")
+
+    assert result == {
+        "metric": "orders.total_revenue",
+        "name": "total_revenue",
+        "model": "orders",
+        "agg": "sum",
+        "expression": "SUM(amount)",
+        "description": "Total revenue from orders",
+        "depends_on": [],
+        "source_models": ["orders"],
+        "source_format": "Sidemantic",
+        "source_file": "orders.yml",
+    }
+
+
+def test_explain_metric_resolves_dependencies_and_transitive_sources(demo_layer):
+    orders = demo_layer.graph.models["orders"]
+    orders.metrics.extend(
+        [
+            Metric(name="refunded_revenue", agg="sum", sql="refunded_amount"),
+            Metric(
+                name="net_revenue",
+                type="derived",
+                sql="total_revenue - refunded_revenue",
+                filters=["status != 'failed'"],
+            ),
+        ]
+    )
+
+    result = explain_metric("orders.net_revenue")
+
+    assert result["expression"] == "total_revenue - refunded_revenue"
+    assert result["depends_on"] == ["orders.refunded_revenue", "orders.total_revenue"]
+    assert result["source_models"] == ["orders"]
+    assert result["filters"] == ["status != 'failed'"]
+
+
+def test_explain_metric_recovers_auto_registered_model_metric_owner(demo_layer):
+    orders = demo_layer.graph.models["orders"]
+    metric = Metric(name="revenue_yoy", type="time_comparison", base_metric="total_revenue", comparison_type="yoy")
+    orders.metrics.append(metric)
+    demo_layer.graph.metrics[metric.name] = metric
+
+    result = explain_metric("revenue_yoy")
+
+    assert result["metric"] == "orders.revenue_yoy"
+    assert result["model"] == "orders"
+    assert result["depends_on"] == ["orders.total_revenue"]
+    assert result["source_models"] == ["orders"]
+    assert result["source_file"] == "orders.yml"
+
+
+def test_explain_metric_rejects_unknown_and_hidden_metrics(demo_layer):
+    with pytest.raises(ValueError, match="Metric 'orders.missing' not found"):
+        explain_metric("orders.missing")
+
+    orders = demo_layer.graph.models["orders"]
+    orders.metrics.append(Metric(name="secret_revenue", agg="sum", sql="amount", public=False))
+    demo_layer.enforce_visibility = True
+
+    with pytest.raises(ValueError, match="Metric 'orders.secret_revenue' not found"):
+        explain_metric("orders.secret_revenue")
+
+
+def test_explain_graph_metric_reports_cross_model_lineage(demo_layer):
+    customers = Model(
+        name="customers",
+        table="customers_table",
+        metrics=[Metric(name="customer_count", agg="count_distinct", sql="customer_id")],
+    )
+    demo_layer.add_model(customers)
+    demo_layer.add_metric(
+        Metric(
+            name="revenue_per_customer",
+            type="derived",
+            sql="orders.total_revenue / customers.customer_count",
+        )
+    )
+
+    result = explain_metric("revenue_per_customer")
+
+    assert result["metric"] == "revenue_per_customer"
+    assert result["depends_on"] == ["customers.customer_count", "orders.total_revenue"]
+    assert result["source_models"] == ["customers", "orders"]
+
+
+def test_explain_metric_does_not_leak_hidden_dependency(demo_layer):
+    orders = demo_layer.graph.models["orders"]
+    orders.metrics.extend(
+        [
+            Metric(name="internal_cost", agg="sum", sql="cost", public=False),
+            Metric(name="margin", type="derived", sql="total_revenue - internal_cost"),
+        ]
+    )
+    demo_layer.enforce_visibility = True
+
+    result = explain_metric("orders.margin")
+
+    assert result["depends_on"] == ["orders.total_revenue"]
+    assert result["hidden_dependency_count"] == 1
+    assert "internal_cost" not in json.dumps(result)
+
+
+def test_get_models_enriched(demo_layer):
+    """Test that get_models returns enriched model data."""
+    result = get_models(["orders"])
+    model = result["models"][0]
+
+    # Check new fields
+    assert "primary_key" not in model
+    assert model["description"] == "All customer orders"
+
+    # Check segments are included
+    assert "segments" in model
+    assert len(model["segments"]) == 2
+
+    # Check metric description is included
+    revenue = next(m for m in model["metrics"] if m["name"] == "total_revenue")
+    assert revenue["description"] == "Total revenue from orders"
+
+
+def test_run_query_with_offset(demo_layer):
+    """Test run_query with offset for pagination."""
+    result = run_query(
+        dimensions=["orders.customer_name"],
+        metrics=["orders.total_revenue"],
+        order_by=["orders.customer_name"],
+        limit=1,
+        offset=1,
+    )
+
+    assert result["row_count"] == 1
+    assert "OFFSET" in result["sql"].upper()
+
+
+def test_run_query_ungrouped(demo_layer):
+    """Test run_query with ungrouped=True returns raw rows."""
+    result = run_query(
+        dimensions=["orders.customer_name", "orders.order_date"],
+        ungrouped=True,
+    )
+
+    # Should return 3 raw rows (no aggregation)
+    assert result["row_count"] == 3
+
+
+def test_run_query_temporal_json_serialization(demo_layer):
+    """Test that date/datetime values in query results are converted to ISO strings."""
+    result = run_query(
+        dimensions=["orders.order_date"],
+        metrics=["orders.total_revenue"],
+    )
+
+    assert result["row_count"] > 0
+    for row in result["rows"]:
+        for key, value in row.items():
+            assert not isinstance(value, (Decimal,)), f"Found Decimal value for {key}"
+
+    # The entire result must be JSON serializable
+    try:
+        json.dumps(result)
+    except TypeError as e:
+        pytest.fail(f"Result with date values is not JSON serializable: {e}")
+
+    # Date values should be ISO format strings
+    for row in result["rows"]:
+        if "order_date" in row:
+            assert isinstance(row["order_date"], str), f"Expected ISO string, got {type(row['order_date'])}"
+
+
+def test_run_sql_temporal_json_serialization(demo_layer):
+    """Test that run_sql converts temporal values to ISO strings."""
+    result = run_sql("SELECT order_date__month, total_revenue FROM orders")
+
+    assert result["row_count"] > 0
+    try:
+        json.dumps(result)
+    except TypeError as e:
+        pytest.fail(f"run_sql result with temporal values is not JSON serializable: {e}")
+
+
+def test_catalog_resource(demo_layer):
+    """Test catalog_resource returns valid JSON catalog metadata."""
+    result = catalog_resource()
+
+    catalog = json.loads(result)
+    assert "tables" in catalog
+    assert "columns" in catalog
+    assert "constraints" in catalog
+    assert "key_column_usage" in catalog
+
+    # Check that orders table is present
+    table_names = [t["table_name"] for t in catalog["tables"]]
+    assert "orders" in table_names
+
+    # Check that columns include dimensions and metrics
+    order_cols = [c for c in catalog["columns"] if c["table_name"] == "orders"]
+    col_names = [c["column_name"] for c in order_cols]
+    assert "customer_name" in col_names
+    assert "total_revenue" in col_names
+
+
+def test_convert_to_json_compatible_handles_common_scalar_types():
+    assert _convert_to_json_compatible(Decimal("12.5")) == 12.5
+    assert _convert_to_json_compatible(date(2024, 1, 2)) == "2024-01-02"
+    assert _convert_to_json_compatible(time(12, 30, 45)) == "12:30:45"
+    assert _convert_to_json_compatible(datetime(2024, 1, 2, 3, 4, 5)) == "2024-01-02T03:04:05"
+    assert _convert_to_json_compatible("plain") == "plain"
+
+
+def test_initialize_layer_builds_connection_from_db_path(tmp_path):
+    model_file = tmp_path / "orders.yml"
+    model_file.write_text(
+        """
+models:
+  - name: orders
+    table: orders_table
+    primary_key: id
+    dimensions:
+      - name: status
+        sql: status
+        type: categorical
+"""
+    )
+
+    layer = initialize_layer(str(tmp_path), db_path=":memory:")
+
+    assert layer.connection_string == "duckdb:///:memory:"
+    assert "orders" in layer.graph.models
+
+
+def test_format_join_condition_handles_all_relationship_shapes():
+    models = {
+        "orders": Model(name="orders", table="orders", primary_key="id"),
+        "customers": Model(name="customers", table="customers", primary_key="id"),
+        "line_items": Model(name="line_items", table="line_items", primary_key="id"),
+        "products": Model(name="products", table="products", primary_key="id"),
+        "order_products": Model(name="order_products", table="order_products", primary_key="id"),
+    }
+
+    assert (
+        _format_join_condition(
+            "orders",
+            Relationship(name="customers", type="many_to_one", foreign_key="customer_id"),
+            models,
+        )
+        == "orders.customer_id = customers.id"
+    )
+    assert (
+        _format_join_condition(
+            "orders",
+            Relationship(name="line_items", type="one_to_many", foreign_key="order_id"),
+            models,
+        )
+        == "line_items.order_id = orders.id"
+    )
+    assert (
+        _format_join_condition(
+            "orders",
+            Relationship(
+                name="line_items",
+                type="one_to_many",
+                foreign_key="account_id",
+                primary_key="account_id",
+            ),
+            models,
+        )
+        == "line_items.account_id = orders.account_id"
+    )
+    assert (
+        _format_join_condition(
+            "orders",
+            Relationship(
+                name="products",
+                type="many_to_many",
+                through="order_products",
+                through_foreign_key="order_id",
+                related_foreign_key="product_id",
+            ),
+            models,
+        )
+        == "orders.id = order_products.order_id AND order_products.product_id = products.id"
+    )
+    assert _format_join_condition("orders", Relationship(name="missing", type="many_to_one"), models) is None
+
+
+def test_format_join_condition_handles_composite_one_to_many_keys():
+    models = {
+        "orders": Model(name="orders", table="orders", primary_key=["tenant_id", "order_id"]),
+        "line_items": Model(name="line_items", table="line_items", primary_key="id"),
+    }
+
+    assert (
+        _format_join_condition(
+            "orders",
+            Relationship(
+                name="line_items",
+                type="one_to_many",
+                foreign_key=["tenant_id", "order_id"],
+                primary_key=["tenant_id", "order_id"],
+            ),
+            models,
+        )
+        == "line_items.tenant_id = orders.tenant_id AND line_items.order_id = orders.order_id"
+    )
+
+
+def test_format_join_condition_looks_up_canonical_target_and_renders_role():
+    models = {
+        "orders": Model(name="orders", table="orders", primary_key="id"),
+        "customers": Model(name="customers", table="customers", primary_key="id"),
+    }
+
+    condition = _format_join_condition(
+        "orders",
+        Relationship(
+            name="buyer",
+            target_model="customers",
+            type="many_to_one",
+            foreign_key="customer_id",
+        ),
+        models,
+    )
+
+    assert condition == "orders.customer_id = buyer.id"
+
+
+def test_get_models_includes_join_conditions_and_source_metadata():
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        (tmpdir / "models.yml").write_text(
+            """
+models:
+  - name: customers
+    table: customers
+    primary_key: id
+    dimensions:
+      - name: name
+        sql: name
+        type: categorical
+  - name: orders
+    table: orders
+    primary_key: id
+    relationships:
+      - name: customers
+        type: many_to_one
+        foreign_key: customer_id
+    dimensions:
+      - name: customer_id
+        sql: customer_id
+        type: categorical
+"""
+        )
+
+        layer = initialize_layer(str(tmpdir), db_path=":memory:")
+        layer.graph.models["orders"]._source_format = "yaml"
+        layer.graph.models["orders"]._source_file = str(tmpdir / "models.yml")
+
+        result = get_models(["orders"])
+        model = result["models"][0]
+        relationship = model["relationships"][0]
+
+        assert relationship["join_condition"] == "orders.customer_id = customers.id"
+        assert model["source_format"] == "yaml"
+        assert model["source_file"].endswith("models.yml")
+    finally:
+        import shutil
+
+        shutil.rmtree(tmpdir)
+
+
+def test_get_semantic_graph_includes_joinable_pairs_and_graph_metrics():
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        (tmpdir / "models.yml").write_text(
+            """
+models:
+  - name: customers
+    table: customers
+    primary_key: id
+    dimensions:
+      - name: name
+        sql: name
+        type: categorical
+  - name: orders
+    table: orders
+    primary_key: id
+    relationships:
+      - name: customers
+        type: many_to_one
+        foreign_key: customer_id
+    dimensions:
+      - name: customer_id
+        sql: customer_id
+        type: categorical
+    metrics:
+      - name: order_count
+        agg: count
+"""
+        )
+        layer = initialize_layer(str(tmpdir), db_path=":memory:")
+        layer.add_metric(Metric(name="global_ratio", type="derived", sql="1"))
+
+        result = get_semantic_graph()
+
+        assert any(pair["from"] == "customers" and pair["to"] == "orders" for pair in result["joinable_pairs"])
+        assert any(metric["name"] == "global_ratio" for metric in result["graph_metrics"])
+    finally:
+        import shutil
+
+        shutil.rmtree(tmpdir)
+
+
+def test_create_chart_returns_ui_resource_when_apps_enabled(monkeypatch, demo_layer, stub_chart_rendering):
+    import sidemantic.mcp_server as mcp_mod
+
+    def fake_resource(spec):
+        return {"resource": spec["mark"]}
+
+    monkeypatch.setattr("sidemantic.apps.create_chart_resource", fake_resource)
+
+    old_value = mcp_mod._apps_enabled
+    mcp_mod._apps_enabled = True
+    try:
+        result = create_chart(
+            dimensions=["orders.customer_name"],
+            metrics=["orders.total_revenue"],
+            chart_type="bar",
+        )
+    finally:
+        mcp_mod._apps_enabled = old_value
+
+    assert isinstance(result, list)
+    assert result[0]["row_count"] == 2
+    assert result[1] == {"resource": "bar"}

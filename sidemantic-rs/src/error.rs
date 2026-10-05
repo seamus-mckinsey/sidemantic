@@ -4,12 +4,18 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SidemanticError {
+    #[error("Unsupported semantic features: {capabilities:?}")]
+    UnsupportedSemanticFeatures { capabilities: Vec<String> },
+    #[error("{0}")]
+    Security(String),
+    #[error("{0}")]
+    YardstickBinding(String),
     // Model errors
     #[error("Model not found: '{0}'. Available models: {1}")]
     ModelNotFound(String, String),
 
     #[error(
-        "Dimension not found: '{dimension}' in model '{model}'. Available dimensions: {available}"
+        "Dimension '{dimension}' not found in model '{model}'. Available dimensions: {available}"
     )]
     DimensionNotFound {
         model: String,
@@ -17,14 +23,14 @@ pub enum SidemanticError {
         available: String,
     },
 
-    #[error("Metric not found: '{metric}' in model '{model}'. Available metrics: {available}")]
+    #[error("Metric '{metric}' not found in model '{model}'. Available metrics: {available}")]
     MetricNotFound {
         model: String,
         metric: String,
         available: String,
     },
 
-    #[error("Segment not found: '{segment}' in model '{model}'. Available segments: {available}")]
+    #[error("Segment '{segment}' not found in model '{model}'. Available segments: {available}")]
     SegmentNotFound {
         model: String,
         segment: String,
@@ -33,7 +39,7 @@ pub enum SidemanticError {
 
     // Join/relationship errors
     #[error(
-        "No join path found between '{from}' and '{to}'. Check that a relationship is defined."
+        "No join path found between models '{from}' and '{to}'. Check that a relationship is defined."
     )]
     NoJoinPath { from: String, to: String },
 
@@ -50,11 +56,22 @@ pub enum SidemanticError {
     #[error("SQL generation error: {0}")]
     SqlGeneration(String),
 
+    // Database execution errors
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error("Connection URL error: {0}")]
+    ConnectionUrl(String),
+
     // Reference errors
-    #[error("Invalid reference: '{reference}'. Expected format: model.field or model.field__granularity")]
+    #[error(
+        "Invalid reference: '{reference}'. Expected format: model.field or model.field__granularity"
+    )]
     InvalidReference { reference: String },
 
-    #[error("Ambiguous reference: '{field}' exists in multiple models: {models}. Use model.field syntax.")]
+    #[error(
+        "Ambiguous reference: '{field}' exists in multiple models: {models}. Use model.field syntax."
+    )]
     AmbiguousReference { field: String, models: String },
 
     // Configuration errors
@@ -74,6 +91,15 @@ pub enum SidemanticError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Validation error [{code}] at {field}: {message}")]
+    ValidationIssue {
+        code: String,
+        model: Option<String>,
+        field: String,
+        reference: Option<String>,
+        message: String,
+    },
+
     #[error("Circular dependency detected: {0}")]
     CircularDependency(String),
 
@@ -81,7 +107,9 @@ pub enum SidemanticError {
     MissingField { field: String, context: String },
 
     // Metric-specific errors
-    #[error("Invalid metric type: '{metric}' is a {metric_type} metric but was used as a simple aggregation")]
+    #[error(
+        "Invalid metric type: '{metric}' is a {metric_type} metric but was used as a simple aggregation"
+    )]
     InvalidMetricUsage { metric: String, metric_type: String },
 
     #[error(
@@ -122,6 +150,22 @@ impl SidemanticError {
             available: available.join(", "),
         }
     }
+
+    pub fn validation_issue(
+        code: &str,
+        model: Option<&str>,
+        field: &str,
+        reference: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        SidemanticError::ValidationIssue {
+            code: code.to_string(),
+            model: model.map(ToString::to_string),
+            field: field.to_string(),
+            reference: reference.map(ToString::to_string),
+            message: message.into(),
+        }
+    }
 }
 
 impl From<std::io::Error> for SidemanticError {
@@ -133,6 +177,27 @@ impl From<std::io::Error> for SidemanticError {
 impl From<serde_yaml::Error> for SidemanticError {
     fn from(err: serde_yaml::Error) -> Self {
         SidemanticError::YamlParse(err.to_string())
+    }
+}
+
+#[cfg(feature = "adbc-exec")]
+impl From<adbc_core::error::Error> for SidemanticError {
+    fn from(err: adbc_core::error::Error) -> Self {
+        SidemanticError::Database(err.to_string())
+    }
+}
+
+#[cfg(feature = "adbc-exec")]
+impl From<arrow_schema::ArrowError> for SidemanticError {
+    fn from(err: arrow_schema::ArrowError) -> Self {
+        SidemanticError::Database(err.to_string())
+    }
+}
+
+#[cfg(feature = "adbc-exec")]
+impl From<url::ParseError> for SidemanticError {
+    fn from(err: url::ParseError) -> Self {
+        SidemanticError::ConnectionUrl(err.to_string())
     }
 }
 

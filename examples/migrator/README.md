@@ -28,7 +28,7 @@ Generate model definitions and rewritten queries from your raw SQL:
 cd examples/migrator
 
 # Generate models and rewritten queries
-uv run sidemantic migrator --queries raw_queries/ --generate-models output/
+uv run sidemantic migrate generate raw_queries/ --output output/
 ```
 
 This will create:
@@ -41,10 +41,10 @@ If you already have a semantic layer, analyze which queries can be rewritten:
 
 ```bash
 # Compare queries against existing semantic layer
-uv run sidemantic migrator models/ --queries raw_queries/
+uv run sidemantic migrate check raw_queries/ --models models/
 
 # Show detailed analysis for each query
-uv run sidemantic migrator models/ --queries raw_queries/ --verbose
+uv run sidemantic migrate check raw_queries/ --models models/ --verbose
 ```
 
 ## What Gets Generated
@@ -60,21 +60,21 @@ GROUP BY status
 
 Generates models like:
 ```yaml
-model:
-  name: orders
-  table: orders
-  description: Auto-generated from query analysis
-dimensions:
-  - name: status
-    sql: status
-    type: categorical
-metrics:
-  - name: count
-    agg: count
-    sql: '*'
-  - name: sum_total_amount
-    agg: sum
-    sql: total_amount
+models:
+  - name: orders
+    table: orders
+    description: Auto-generated from query analysis
+    dimensions:
+      - name: status
+        sql: status
+        type: categorical
+    metrics:
+      - name: count
+        agg: count
+        sql: '*'
+      - name: sum_total_amount
+        agg: sum
+        sql: total_amount
 ```
 
 ### Rewritten Queries

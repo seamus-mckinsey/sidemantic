@@ -1,0 +1,1 @@
+"""Metabase adapter tests package."""

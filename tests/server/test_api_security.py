@@ -1,0 +1,418 @@
+"""Tests for HTTP API security integration (work item A3).
+
+Covers per-request user attributes resolved from the trusted user header and
+threaded into the layer compile/query path plus the result-cache key:
+- header present -> attributes reach the query and scope rows;
+- header absent + require_user_attrs -> 400;
+- malformed JSON header -> 400;
+- SecurityError from a secured model (no attrs) -> 403;
+- non-public field with enforce_visibility -> error;
+- result-cache key differs across two different X-Sidemantic-User values.
+"""
+
+# ruff: noqa: E402
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("pyarrow")
+pytest.importorskip("httpx")
+
+from fastapi.testclient import TestClient
+
+from sidemantic import Dimension, Metric, Model, SecurityPolicy, SemanticLayer
+from sidemantic.api_server import create_app
+
+
+def _make_layer() -> SemanticLayer:
+    """Build an in-memory layer whose ``orders`` model has a row-level filter."""
+    layer = SemanticLayer()
+    # Populate the layer's own adapter DB so the app queries the same tables.
+    layer.adapter.execute(
+        """
+        create table orders (
+            id integer,
+            tenant_id integer,
+            status varchar,
+            amount double
+        )
+        """
+    )
+    layer.adapter.executemany(
+        "insert into orders values (?, ?, ?, ?)",
+        [
+            (1, 1, "completed", 10.0),
+            (2, 1, "completed", 20.0),
+            (3, 2, "completed", 5.0),
+            (4, 2, "pending", 7.0),
+        ],
+    )
+
+    model = Model(
+        name="orders",
+        table="orders",
+        primary_key="id",
+        dimensions=[
+            Dimension(name="tenant_id", sql="tenant_id", type="numeric"),
+            Dimension(name="status", sql="status", type="categorical"),
+            Dimension(name="secret_note", sql="status", type="categorical", public=False),
+        ],
+        metrics=[
+            Metric(name="order_count", agg="count"),
+            Metric(name="total_amount", agg="sum", sql="amount"),
+        ],
+        security=SecurityPolicy(row_filters=["tenant_id = {{ user.tenant_id }}"]),
+    )
+    layer.add_model(model)
+    return layer
+
+
+def _headers(token: str = "secret", user_attrs: dict | None = None, header: str = "X-Sidemantic-User") -> dict:
+    out = {"Authorization": f"Bearer {token}"}
+    if user_attrs is not None:
+        out[header] = json.dumps(user_attrs)
+    return out
+
+
+def test_user_header_scopes_rows():
+    """Header present -> attributes reach the query and scope rows to the tenant."""
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"], "dimensions": ["orders.tenant_id"]},
+        headers=_headers(user_attrs={"tenant_id": 1}),
+    )
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()["rows"]
+    # Only tenant 1 rows should be visible.
+    tenants = {row["tenant_id"] for row in rows}
+    assert tenants == {1}
+    total = sum(row["total_amount"] for row in rows)
+    assert total == 30.0
+
+
+def test_require_user_attrs_missing_header_returns_400():
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True, require_user_attrs=True)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"]},
+        headers=_headers(),  # no user header
+    )
+    assert resp.status_code == 400
+    assert "user-attributes header" in resp.json()["detail"].lower()
+
+
+def test_malformed_json_header_returns_400():
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"]},
+        headers={"Authorization": "Bearer secret", "X-Sidemantic-User": "{not valid json"},
+    )
+    assert resp.status_code == 400
+    assert "malformed json" in resp.json()["detail"].lower()
+
+
+def test_non_object_json_header_returns_400():
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"]},
+        headers={"Authorization": "Bearer secret", "X-Sidemantic-User": "[1, 2, 3]"},
+    )
+    assert resp.status_code == 400
+    assert "json object" in resp.json()["detail"].lower()
+
+
+def test_secured_model_without_attrs_returns_403():
+    """A secured model queried with no user attributes -> SecurityError -> 403."""
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"]},
+        headers=_headers(),  # no user header -> None attrs -> deny-by-default
+    )
+    assert resp.status_code == 403
+    assert "error" in resp.json()
+
+
+def test_enforce_visibility_rejects_non_public_field():
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True, enforce_visibility=True)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/query",
+        json={"dimensions": ["orders.secret_note"], "metrics": ["orders.order_count"]},
+        headers=_headers(user_attrs={"tenant_id": 1}),
+    )
+    assert resp.status_code == 403
+    assert "not public" in resp.json()["error"].lower()
+
+
+def test_custom_user_header_name():
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True, user_header="X-My-User")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"], "dimensions": ["orders.tenant_id"]},
+        headers=_headers(user_attrs={"tenant_id": 2}, header="X-My-User"),
+    )
+    assert resp.status_code == 200, resp.text
+    tenants = {row["tenant_id"] for row in resp.json()["rows"]}
+    assert tenants == {2}
+
+
+def test_result_cache_key_differs_across_users():
+    """The result-cache key must differ for different X-Sidemantic-User values.
+
+    Two users with the same compiled query (differing only by user attributes)
+    must not share a cached result. We assert directly on build_result_key so the
+    test does not depend on cache internals.
+    """
+    layer = _make_layer()
+    # Same compiled SQL string, different user attributes -> different keys.
+    sql = "select 1"
+    key_user_a = layer.build_result_key(sql, user_attributes={"tenant_id": 1})
+    key_user_b = layer.build_result_key(sql, user_attributes={"tenant_id": 2})
+    key_none = layer.build_result_key(sql, user_attributes=None)
+    assert key_user_a != key_user_b
+    assert key_user_a != key_none
+    assert key_user_b != key_none
+
+
+def test_result_cache_no_cross_user_leak_end_to_end():
+    """End-to-end: caching enabled, two different users get their own scoped rows."""
+    layer = _make_layer()
+    app = create_app(layer, auth_token="secret", trust_user_header=True, result_cache_mb=16)
+    client = TestClient(app)
+
+    resp_a = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"], "dimensions": ["orders.tenant_id"]},
+        headers=_headers(user_attrs={"tenant_id": 1}),
+    )
+    resp_b = client.post(
+        "/query",
+        json={"metrics": ["orders.total_amount"], "dimensions": ["orders.tenant_id"]},
+        headers=_headers(user_attrs={"tenant_id": 2}),
+    )
+    assert resp_a.status_code == 200, resp_a.text
+    assert resp_b.status_code == 200, resp_b.text
+    tenants_a = {row["tenant_id"] for row in resp_a.json()["rows"]}
+    tenants_b = {row["tenant_id"] for row in resp_b.json()["rows"]}
+    assert tenants_a == {1}
+    assert tenants_b == {2}
+
+
+def test_sql_endpoint_enforces_row_filter_when_model_secured():
+    """Semantic SQL uses the same row-filtered generator as /query."""
+    layer = _make_layer()
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True))
+    resp = client.post(
+        "/sql",
+        json={"query": "SELECT order_count FROM orders"},
+        headers=_headers(user_attrs={"tenant_id": 1}),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == [{"order_count": 2}]
+
+
+def test_sql_compile_endpoint_enforces_row_filter_when_model_secured():
+    layer = _make_layer()
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True))
+    resp = client.post(
+        "/sql/compile",
+        json={"query": "SELECT order_count FROM orders"},
+        headers=_headers(user_attrs={"tenant_id": 2}),
+    )
+    assert resp.status_code == 200, resp.text
+    assert "WHERE tenant_id = 2" in resp.json()["sql"]
+
+
+def test_raw_endpoint_denied_when_model_secured():
+    """P0-3: /raw reads the underlying table directly, so it must refuse under security."""
+    layer = _make_layer()
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True))
+    resp = client.post(
+        "/raw",
+        json={"query": "SELECT * FROM orders"},
+        headers=_headers(user_attrs={"tenant_id": 1}),
+    )
+    assert resp.status_code == 403, resp.text
+
+
+def test_sql_passthrough_denied_when_security_active():
+    layer = _make_layer()
+    layer.adapter.execute("create table audit_log (message varchar)")
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True))
+    resp = client.post(
+        "/sql",
+        json={"query": "SELECT message FROM audit_log"},
+        headers=_headers(user_attrs={"tenant_id": 1}),
+    )
+    assert resp.status_code == 403, resp.text
+    assert "non-semantic" in resp.json()["error"]
+
+
+def test_sql_and_raw_deny_hidden_fields_when_visibility_enforced():
+    layer = _make_layer()
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True, enforce_visibility=True))
+    headers = _headers(user_attrs={"tenant_id": 1})
+
+    sql_resp = client.post(
+        "/sql",
+        json={"query": "SELECT secret_note, order_count FROM orders"},
+        headers=headers,
+    )
+    assert sql_resp.status_code == 403, sql_resp.text
+    assert "not public" in sql_resp.json()["error"]
+
+    raw_resp = client.post("/raw", json={"query": "SELECT status FROM orders"}, headers=headers)
+    assert raw_resp.status_code == 403, raw_resp.text
+    assert "raw sql bypasses" in raw_resp.json()["error"].lower()
+
+
+def test_sql_endpoint_allowed_without_security():
+    """The free-form SQL endpoints stay available when no model declares a policy."""
+    layer = SemanticLayer()
+    layer.adapter.execute("create table t (id integer)")
+    layer.adapter.execute("insert into t values (1), (2)")
+    layer.add_model(Model(name="t", table="t", primary_key="id", metrics=[Metric(name="cnt", agg="count")]))
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True))
+    resp = client.post("/raw", json={"query": "SELECT count(*) AS n FROM t"}, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == [{"n": 2}]
+
+
+def test_models_catalog_hides_non_public_fields_when_enforcing():
+    """P2: /models must not enumerate public=False fields when enforce_visibility is on."""
+    layer = _make_layer()
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True, enforce_visibility=True))
+    resp = client.get("/models", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    orders = next(m for m in resp.json() if m["name"] == "orders")
+    assert "secret_note" not in orders["dimensions"]
+    assert "status" in orders["dimensions"]
+
+
+def test_models_catalog_shows_all_fields_without_enforcement():
+    layer = _make_layer()
+    client = TestClient(create_app(layer, auth_token="secret", trust_user_header=True))
+    resp = client.get("/models", headers=_headers())
+    orders = next(m for m in resp.json() if m["name"] == "orders")
+    assert "secret_note" in orders["dimensions"]
+
+
+def test_direct_client_cannot_choose_tenant():
+    client = TestClient(create_app(_make_layer(), auth_token="secret"))
+    for attrs in ({"tenant_id": 2}, {"role": "admin", "tenant_id": 1}):
+        response = client.post("/query", json={"metrics": ["orders.order_count"]}, headers=_headers(user_attrs=attrs))
+        assert response.status_code == 403
+
+
+def test_verified_resolver_ignores_forged_header():
+    client = TestClient(
+        create_app(_make_layer(), auth_token="secret", user_attributes_resolver=lambda request: {"tenant_id": 1})
+    )
+    response = client.post(
+        "/query", json={"metrics": ["orders.order_count"]}, headers=_headers(user_attrs={"tenant_id": 2})
+    )
+    assert response.status_code == 200
+    assert response.json()["rows"] == [{"order_count": 2}]
+
+
+def test_proxy_mode_requires_authentication():
+    with pytest.raises(ValueError, match="requires bearer"):
+        create_app(_make_layer(), trust_user_header=True)
+
+
+@pytest.mark.parametrize("endpoint", ["/mcp", "/mcp/"])
+@pytest.mark.parametrize("serve_ui", [False, True])
+def test_mounted_mcp_auth_and_request_identity(monkeypatch, tmp_path, endpoint, serve_ui):
+    import sidemantic.api_server as api_module
+    import sidemantic.mcp_server as mcp_module
+
+    (tmp_path / "index.html").write_text("<html>UI shell</html>")
+    monkeypatch.setattr(api_module, "ui_static_dir", lambda: tmp_path)
+    monkeypatch.setattr(mcp_module, "_user_attributes", {"tenant_id": 2})
+    app = create_app(
+        _make_layer(),
+        auth_token="secret",
+        serve_mcp=True,
+        serve_ui=serve_ui,
+        user_attributes_resolver=lambda request: {"tenant_id": 1},
+    )
+    headers = {"Accept": "application/json, text/event-stream"}
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "run_sql", "arguments": {"query": "select order_count from orders"}},
+    }
+    with TestClient(app, base_url="http://localhost:4400") as client:
+        if endpoint == "/mcp":
+            response = client.post(endpoint + "?client=test", headers=headers, json=payload, follow_redirects=False)
+            assert response.status_code == 307
+            assert response.headers["location"] == "http://localhost:4400/mcp/?client=test"
+        for method in ("POST", "GET", "DELETE"):
+            response = client.request(method, endpoint, headers=headers, json=payload)
+            assert response.status_code == 401
+        response = client.post(endpoint, headers={**headers, **_headers()}, json=payload)
+        assert response.status_code == 200, response.text
+        assert '"order_count": 2' in response.text or '\\"order_count\\": 2' in response.text
+
+
+def test_mounted_mcp_identity_does_not_persist_between_requests(monkeypatch):
+    import sidemantic.mcp_server as mcp_module
+
+    monkeypatch.setattr(mcp_module, "_user_attributes", {"tenant_id": 99})
+    app = create_app(_make_layer(), auth_token="secret", trust_user_header=True, serve_mcp=True)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "run_sql", "arguments": {"query": "select total_amount from orders"}},
+    }
+    with TestClient(app, base_url="http://localhost:4400") as client:
+        for attrs, total in (({"tenant_id": 1}, 30.0), ({"tenant_id": 2}, 12.0)):
+            response = client.post(
+                "/mcp/",
+                headers={**_headers(user_attrs=attrs), "Accept": "application/json, text/event-stream"},
+                json=payload,
+            )
+            assert response.status_code == 200
+            event = json.loads(next(line[6:] for line in response.text.splitlines() if line.startswith("data: ")))
+            assert json.loads(event["result"]["content"][0]["text"])["rows"] == [{"total_amount": total}]
+        response = client.post(
+            "/mcp/", headers={**_headers(), "Accept": "application/json, text/event-stream"}, json=payload
+        )
+        event = json.loads(next(line[6:] for line in response.text.splitlines() if line.startswith("data: ")))
+        assert event["result"]["isError"] is True
+        session = client.post("/auth/session", headers=_headers())
+        assert session.status_code == 200
+        response = client.post("/mcp/", headers={"Accept": "application/json, text/event-stream"}, json=payload)
+        assert response.status_code == 200
+        client.delete("/auth/session")
+        assert client.post("/mcp/", json=payload).status_code == 401

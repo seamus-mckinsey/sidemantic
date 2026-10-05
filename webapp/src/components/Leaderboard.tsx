@@ -1,0 +1,165 @@
+import type { Ref } from "react";
+import { displayDimValue, type Tone } from "../lib/format";
+import type { ContextColumn } from "../state/explorerState";
+
+export type LeaderboardRow = {
+  value: string;
+  metric: number;
+  /** Optional context figure (% of total / delta) rendered beside the metric, already formatted. */
+  context?: { label: string; tone: Tone };
+};
+
+type ContextOption = { key: ContextColumn; label: string; title: string };
+
+type LeaderboardProps = {
+  dimension: string; // ref, exposed as data-dimension on rows
+  title: string;
+  metricLabel: string;
+  rows: LeaderboardRow[];
+  selectedValues?: string[];
+  loading?: boolean;
+  formatMetric: (value: number) => string;
+  onToggle?: (value: string) => void;
+  contextColumn?: ContextColumn;
+  contextOptions?: ContextOption[];
+  onContextColumn?: (column: ContextColumn) => void;
+  collapsedLimit?: number;
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+  /** Attached to the root section, so an owner can measure or observe the panel (lazy mounting). */
+  containerRef?: Ref<HTMLElement>;
+};
+
+const CONTEXT_TONE: Record<Tone, string> = {
+  positive: "text-success",
+  negative: "text-danger",
+  neutral: "text-faint",
+};
+
+export function Leaderboard({
+  dimension,
+  title,
+  metricLabel,
+  rows,
+  selectedValues = [],
+  loading,
+  formatMetric,
+  onToggle,
+  contextColumn = "none",
+  contextOptions,
+  onContextColumn,
+  collapsedLimit = 6,
+  expanded = false,
+  onExpandedChange,
+  containerRef,
+}: LeaderboardProps) {
+  const selected = new Set(selectedValues);
+  const visibleRows = expanded ? rows : rows.slice(0, collapsedLimit);
+  const maxMagnitude = Math.max(1, ...visibleRows.map((row) => Math.abs(row.metric)));
+  const expandable = expanded || rows.length > collapsedLimit;
+  const showContext = contextColumn !== "none";
+  // Grid gains a third, right-aligned column only when a context column is active, so the plain
+  // leaderboard keeps its exact two-column layout.
+  const rowGrid = showContext
+    ? "grid-cols-[minmax(0,1fr)_auto_auto]"
+    : "grid-cols-[minmax(0,1fr)_auto]";
+
+  return (
+    <section
+      ref={containerRef}
+      data-testid="dimension-leaderboard"
+      data-dimension={dimension}
+      data-expanded={expanded || undefined}
+      aria-label={`${title}, ranked by ${metricLabel}`}
+      className="flex min-h-40 flex-col border-b border-r border-line bg-surface data-[expanded=true]:col-span-full"
+    >
+      <header className="flex items-center justify-between gap-3 px-3 pb-2 pt-2.5">
+        <div className="flex min-w-0 items-baseline gap-2">
+          <h3 className="truncate text-sm font-semibold text-ink">{title}</h3>
+          <p className="sr-only">Ranked by {metricLabel}</p>
+        </div>
+        {contextOptions && onContextColumn ? (
+          <div
+            role="group"
+            aria-label="Context column"
+            data-testid="leaderboard-context-toggle"
+            className="flex shrink-0 overflow-hidden border border-line text-2xs"
+          >
+            {contextOptions.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                title={option.title}
+                aria-pressed={contextColumn === option.key}
+                data-context={option.key}
+                data-active={contextColumn === option.key || undefined}
+                onClick={() => onContextColumn(option.key)}
+                className="border-l border-line px-1.5 py-0.5 font-mono text-faint first:border-l-0 hover:bg-surface-soft data-[active=true]:bg-accent-soft data-[active=true]:text-accent"
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </header>
+      <div data-testid="leaderboard-rows">
+        {loading && rows.length === 0 ? (
+          <div className="space-y-2 p-3">
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className="skeleton h-5 w-full" />
+            ))}
+          </div>
+        ) : rows.length === 0 ? (
+          <p className="px-3 py-4 text-xs text-faint">No values</p>
+        ) : (
+          visibleRows.map((row) => {
+            const tone = row.metric < 0 ? "negative" : "positive";
+            const isSelected = selected.has(row.value);
+            const width = `${Math.round((Math.abs(row.metric) / maxMagnitude) * 100)}%`;
+            return (
+              <button
+                key={`${dimension}:${row.value}`}
+                type="button"
+                data-dimension={dimension}
+                data-value={row.value}
+                data-selected={isSelected || undefined}
+                data-tone={tone}
+                onClick={() => onToggle?.(row.value)}
+                aria-pressed={isSelected}
+                className={`leaderboard-row relative grid w-full ${rowGrid} items-center gap-3 overflow-hidden border-0 bg-transparent px-3 py-1 text-left text-xs text-ink data-[selected=true]:bg-chart-primary-selected`}
+              >
+                <span
+                  aria-hidden="true"
+                  className={`absolute inset-y-0 left-0 ${tone === "negative" ? "bg-danger-soft" : "bg-chart-primary-soft"}`}
+                  style={{ width }}
+                />
+                <span className="relative min-w-0 truncate text-muted">{displayDimValue(row.value)}</span>
+                <strong className="relative tnum font-semibold text-ink">{formatMetric(row.metric)}</strong>
+                {showContext ? (
+                  <span
+                    data-testid="leaderboard-context"
+                    data-tone={row.context?.tone ?? "neutral"}
+                    className={`relative w-14 text-right font-mono tnum text-2xs ${CONTEXT_TONE[row.context?.tone ?? "neutral"]}`}
+                  >
+                    {row.context?.label ?? "—"}
+                  </span>
+                ) : null}
+              </button>
+            );
+          })
+        )}
+      </div>
+      {expandable && !loading ? (
+        <button
+          type="button"
+          data-action={expanded ? "leaderboard-back" : "leaderboard-expand"}
+          aria-expanded={expanded}
+          onClick={() => onExpandedChange?.(!expanded)}
+          className="leaderboard-expand border-0 border-t border-line bg-transparent px-3 py-1 text-left text-xs font-normal text-faint hover:text-accent"
+        >
+          {expanded ? "← All dimensions" : `Expand table (${rows.length})`}
+        </button>
+      ) : null}
+    </section>
+  );
+}

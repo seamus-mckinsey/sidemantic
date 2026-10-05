@@ -1,7 +1,30 @@
 """Tests for coverage analyzer model and query generation."""
 
+from pathlib import Path
+
 from sidemantic import SemanticLayer
 from sidemantic.core.migrator import Migrator
+
+
+def test_generate_models_parses_bigquery_history_with_source_dialect():
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer, dialect="bigquery")
+
+    report = analyzer.analyze_queries(
+        [
+            """
+            SELECT status, SUM(amount) AS revenue
+            FROM `project.dataset.orders`
+            GROUP BY status
+            """
+        ]
+    )
+    models = analyzer.generate_models(report)
+
+    assert report.parseable_queries == 1
+    assert "orders" in models
+    assert models["orders"]["table"] == "orders"
+    assert {metric["name"] for metric in models["orders"]["metrics"]} == {"revenue"}
 
 
 def test_generate_models_from_queries():
@@ -32,8 +55,8 @@ def test_generate_models_from_queries():
 
     # Check orders model
     orders = models["orders"]
-    assert orders["model"]["name"] == "orders"
-    assert orders["model"]["table"] == "orders"
+    assert orders["name"] == "orders"
+    assert orders["table"] == "orders"
 
     # Check orders dimensions
     assert len(orders["dimensions"]) == 2
@@ -49,7 +72,7 @@ def test_generate_models_from_queries():
 
     # Check products model
     products = models["products"]
-    assert products["model"]["name"] == "products"
+    assert products["name"] == "products"
 
     # Check products dimensions
     assert len(products["dimensions"]) == 1
@@ -59,7 +82,7 @@ def test_generate_models_from_queries():
     assert len(products["metrics"]) == 2
     metric_names = {m["name"] for m in products["metrics"]}
     assert "avg_price" in metric_names
-    assert "product_id_count" in metric_names
+    assert "product_id_count_distinct" in metric_names
 
 
 def test_generate_models_count_distinct():
@@ -81,9 +104,9 @@ def test_generate_models_count_distinct():
     orders = models["orders"]
     metrics = {m["name"]: m for m in orders["metrics"]}
 
-    assert "customer_id_count" in metrics
-    assert metrics["customer_id_count"]["agg"] == "count_distinct"
-    assert metrics["customer_id_count"]["sql"] == "customer_id"
+    assert "customer_id_count_distinct" in metrics
+    assert metrics["customer_id_count_distinct"]["agg"] == "count_distinct"
+    assert metrics["customer_id_count_distinct"]["sql"] == "customer_id"
 
 
 def test_generate_models_no_duplicate_metrics():
@@ -204,9 +227,88 @@ def test_write_model_files(tmp_path):
     with open(orders_file) as f:
         data = yaml.safe_load(f)
 
-    assert data["model"]["name"] == "orders"
-    assert len(data["dimensions"]) == 1
+    assert "models" in data
+    assert len(data["models"]) == 1
+    assert data["models"][0]["name"] == "orders"
+    assert len(data["models"][0]["dimensions"]) == 1
+    assert len(data["models"][0]["metrics"]) == 1
+
+
+def test_write_graph_metrics_file(tmp_path):
+    """Test writing graph-level metrics to disk."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        "SELECT status, SUM(amount) AS revenue FROM orders GROUP BY status",
+        "SELECT segment, COUNT(DISTINCT id) AS customer_count FROM customers GROUP BY segment",
+        """
+        SELECT
+            c.segment,
+            SUM(o.amount) / COUNT(DISTINCT c.id) AS revenue_per_customer
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.segment
+        """,
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+    graph_metrics = analyzer.generate_graph_metrics(report, models)
+
+    output_dir = tmp_path / "models"
+    path = analyzer.write_graph_metrics_file(graph_metrics, str(output_dir))
+
+    assert path is not None
+    graph_file = output_dir / "graph_metrics.yml"
+    assert graph_file.exists()
+
+    import yaml
+
+    with open(graph_file) as f:
+        data = yaml.safe_load(f)
+
+    assert "models" in data
+    assert data["models"] == []
+    assert "metrics" in data
     assert len(data["metrics"]) == 1
+    assert data["metrics"][0]["name"] == "revenue_per_customer"
+
+
+def test_generated_graph_metrics_load_from_directory(tmp_path):
+    """Test generated graph metrics are loadable from a models directory."""
+    from sidemantic.loaders import load_from_directory
+
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        "SELECT status, SUM(amount) AS revenue FROM orders GROUP BY status",
+        "SELECT segment, COUNT(DISTINCT id) AS customer_count FROM customers GROUP BY segment",
+        """
+        SELECT
+            c.segment,
+            SUM(o.amount) / COUNT(DISTINCT c.id) AS revenue_per_customer
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.segment
+        """,
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+    graph_metrics = analyzer.generate_graph_metrics(report, models)
+
+    output_dir = tmp_path / "models"
+    analyzer.write_model_files(models, str(output_dir))
+    analyzer.write_graph_metrics_file(graph_metrics, str(output_dir))
+
+    loaded = SemanticLayer(auto_register=False)
+    load_from_directory(loaded, output_dir)
+
+    assert "orders" in loaded.list_models()
+    assert "customers" in loaded.list_models()
+    assert "revenue_per_customer" in loaded.list_metrics()
 
 
 def test_write_rewritten_queries(tmp_path):
@@ -291,6 +393,51 @@ def test_generate_models_with_date_trunc():
     dims = {d["name"]: d for d in orders["dimensions"]}
     assert "order_date" in dims
     assert dims["order_date"]["type"] == "time"
+    assert dims["order_date"]["granularity"] == "month"
+
+
+def test_generate_models_uses_finest_observed_time_granularity():
+    """A time column is emitted once at the finest grain observed in queries."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    report = analyzer.analyze_queries(
+        [
+            "SELECT DATE_TRUNC('month', order_date), COUNT(*) FROM orders GROUP BY 1",
+            "SELECT DATE_TRUNC('day', order_date), COUNT(*) FROM orders GROUP BY 1",
+        ]
+    )
+    models = analyzer.generate_models(report)
+
+    order_date_dimensions = [
+        dimension for dimension in models["orders"]["dimensions"] if dimension["name"] == "order_date"
+    ]
+    assert order_date_dimensions == [
+        {
+            "name": "order_date",
+            "sql": "order_date",
+            "type": "time",
+            "granularity": "day",
+        }
+    ]
+
+
+def test_migrator_example_generates_self_validating_models(tmp_path):
+    """The documented raw-query example produces models accepted by validation."""
+    from sidemantic.validation_runner import validate_directory
+
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+    queries_dir = Path(__file__).parents[1] / "examples" / "migrator" / "raw_queries"
+
+    report = analyzer.analyze_folder(str(queries_dir))
+    models = analyzer.generate_models(report)
+    output_dir = tmp_path / "models"
+    analyzer.write_model_files(models, str(output_dir))
+    analyzer.write_graph_metrics_file(analyzer.generate_graph_metrics(report, models), str(output_dir))
+
+    validation = validate_directory(output_dir)
+    assert validation.errors == []
 
 
 def test_generate_rewritten_query_with_date_trunc():
@@ -835,3 +982,419 @@ def test_information_schema_column_inference():
     assert "amount" in analysis.columns["orders"]
 
     con.close()
+
+
+def test_generate_models_resolves_aliases_in_aggregations():
+    """Test that aggregations with table aliases resolve to real table names."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        """
+        SELECT
+            c.region,
+            SUM(o.total_amount) as total_revenue,
+            COUNT(DISTINCT o.customer_id) as unique_customers
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.region
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+
+    # Metrics should land on 'orders', not on alias 'o'
+    assert "o" not in models
+    assert "orders" in models
+
+    orders = models["orders"]
+    metric_names = {m["name"] for m in orders.get("metrics", [])}
+    assert "total_revenue" in metric_names or "sum_total_amount" in metric_names
+    assert "customer_id_count_distinct" in metric_names or "unique_customers" in metric_names
+
+    # Dimensions should land on 'customers', not on alias 'c'
+    assert "c" not in models
+    assert "customers" in models
+
+    customers = models["customers"]
+    dim_names = {d["name"] for d in customers.get("dimensions", [])}
+    assert "region" in dim_names
+
+
+def test_generate_models_resolves_aliases_in_time_dimensions():
+    """Test that time dimensions with table aliases resolve to real table names."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        """
+        SELECT
+            DATE_TRUNC('month', o.order_date) as month,
+            SUM(o.amount) as revenue
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        GROUP BY DATE_TRUNC('month', o.order_date)
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+
+    assert "orders" in models
+    orders = models["orders"]
+
+    # order_date should be a time dimension on the orders model
+    dims = {d["name"]: d for d in orders.get("dimensions", [])}
+    assert "order_date" in dims
+    assert dims["order_date"]["type"] == "time"
+
+
+def test_generate_models_resolves_aliases_in_derived_metrics():
+    """Test that derived metrics with table aliases resolve to real table names."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        """
+        SELECT
+            c.region,
+            SUM(o.total_amount) / COUNT(*) as avg_order_value
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.region
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+
+    # Derived metric should land on 'orders', not on alias 'o'
+    assert "orders" in models
+    orders = models["orders"]
+    metric_names = {m["name"] for m in orders.get("metrics", [])}
+    assert "avg_order_value" in metric_names
+
+
+def test_cross_model_derived_metric_detection():
+    """Test that derived metrics spanning multiple tables are detected as cross-model."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        """
+        SELECT
+            c.segment,
+            SUM(o.amount) / COUNT(DISTINCT c.id) AS revenue_per_customer
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.segment
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    analysis = report.query_analyses[0]
+
+    # Should be detected as cross-model, NOT stored in derived_metrics
+    assert len(analysis.derived_metrics) == 0
+    assert len(analysis.cross_model_derived_metrics) == 1
+
+    cm = analysis.cross_model_derived_metrics[0]
+    assert cm["name"] == "revenue_per_customer"
+    assert len(cm["agg_parts"]) == 2
+
+    # Verify the tables are correctly resolved
+    tables = {p["table_name"] for p in cm["agg_parts"]}
+    assert tables == {"orders", "customers"}
+
+
+def test_generate_graph_metrics():
+    """Test generating graph-level metric definitions from cross-model derived metrics."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        # Single-table aggregations to create base metrics
+        "SELECT status, SUM(amount) AS revenue FROM orders GROUP BY status",
+        "SELECT segment, COUNT(DISTINCT id) AS customer_count FROM customers GROUP BY segment",
+        # Cross-model derived metric
+        """
+        SELECT
+            c.segment,
+            SUM(o.amount) / COUNT(DISTINCT c.id) AS revenue_per_customer
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.segment
+        """,
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+    graph_metrics = analyzer.generate_graph_metrics(report, models)
+
+    # Should produce one graph-level metric
+    assert len(graph_metrics) == 1
+    gm = graph_metrics[0]
+    assert gm["name"] == "revenue_per_customer"
+    assert gm["type"] == "derived"
+
+    # The sql should reference model.metric_name, not raw aggregations
+    assert "orders." in gm["sql"]
+    assert "customers." in gm["sql"]
+    # Should not contain raw SQL aggregation functions
+    assert "SUM(" not in gm["sql"]
+    assert "COUNT(" not in gm["sql"]
+
+
+def test_single_model_derived_stays_on_model():
+    """Test that single-model derived metrics still go to derived_metrics, not cross_model."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        """
+        SELECT
+            status,
+            SUM(amount) / COUNT(*) AS avg_order_value
+        FROM orders
+        GROUP BY status
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    analysis = report.query_analyses[0]
+
+    # Single-model derived metric should stay in derived_metrics
+    assert len(analysis.derived_metrics) == 1
+    assert analysis.derived_metrics[0][0] == "avg_order_value"
+
+    # Should NOT be in cross_model_derived_metrics
+    assert len(analysis.cross_model_derived_metrics) == 0
+
+
+def test_count_column_distinct_from_count_star():
+    """Test that COUNT(column) is kept separate from COUNT(*).
+
+    COUNT(column) excludes NULLs while COUNT(*) counts all rows.
+    This matters for LEFT JOINs where the joined column can be NULL.
+    """
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    # Single-table query so both COUNT(*) and COUNT(id) are unambiguous
+    queries = [
+        """
+        SELECT
+            status,
+            COUNT(*) AS total_rows,
+            COUNT(customer_id) AS non_null_customers
+        FROM orders
+        GROUP BY status
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+
+    orders = models["orders"]
+
+    # COUNT(*) and COUNT(customer_id) should produce separate metrics
+    count_star = next((m for m in orders["metrics"] if m["sql"] == "*" and m["agg"] == "count"), None)
+    count_col = next((m for m in orders["metrics"] if m["sql"] == "customer_id" and m["agg"] == "count"), None)
+    assert count_star is not None, "COUNT(*) metric should exist"
+    assert count_col is not None, "COUNT(customer_id) metric should exist"
+    assert count_star["name"] != count_col["name"], "They should have different names"
+
+
+def test_count_column_vs_count_distinct_column():
+    """Test that COUNT(col) and COUNT(DISTINCT col) get different metric names."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        """
+        SELECT
+            status,
+            COUNT(customer_id) AS customer_count,
+            COUNT(DISTINCT customer_id) AS unique_customers
+        FROM orders
+        GROUP BY status
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    models = analyzer.generate_models(report)
+
+    orders = models["orders"]
+
+    # Both should exist with different names
+    count_col = next((m for m in orders["metrics"] if m["agg"] == "count" and m.get("sql") == "customer_id"), None)
+    count_dist = next(
+        (m for m in orders["metrics"] if m["agg"] == "count_distinct" and m.get("sql") == "customer_id"), None
+    )
+    assert count_col is not None, "COUNT(customer_id) metric should exist"
+    assert count_dist is not None, "COUNT(DISTINCT customer_id) metric should exist"
+    assert count_col["name"] != count_dist["name"], "COUNT and COUNT DISTINCT should have different names"
+
+
+def test_cross_model_derived_metric_in_rewritten_query():
+    """Test that cross-model derived metrics appear in rewritten queries."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    queries = [
+        """
+        SELECT
+            c.segment,
+            SUM(o.amount) / COUNT(DISTINCT c.id) AS revenue_per_customer
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.segment
+        """
+    ]
+
+    report = analyzer.analyze_queries(queries)
+    rewritten = analyzer.generate_rewritten_queries(report)
+
+    sql = rewritten["query_1"]
+
+    # Cross-model derived metric should appear in the rewritten query
+    assert "revenue_per_customer" in sql
+
+
+def test_window_function_detected_in_any_select_position():
+    """Cumulative metrics must be found even when the window fn is not the last projection."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    report = analyzer.analyze_queries(
+        [
+            """
+            SELECT SUM(amount) OVER (ORDER BY order_date) AS running_total, status
+            FROM orders
+            """
+        ]
+    )
+
+    analysis = report.query_analyses[0]
+    assert analysis.parse_error is None
+    assert len(analysis.cumulative_metrics) == 1
+    assert analysis.cumulative_metrics[0]["name"] == "running_total"
+
+
+def test_non_select_statements_are_skipped():
+    """DDL/DML from warehouse history must not generate models."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    report = analyzer.analyze_queries(
+        [
+            "CREATE TABLE staging_orders AS SELECT * FROM orders",
+            "INSERT INTO audit_log VALUES (1, 'x')",
+            "DELETE FROM temp_table WHERE id = 1",
+            "SELECT status, SUM(amount) FROM orders GROUP BY status",
+        ]
+    )
+    models = analyzer.generate_models(report)
+
+    assert report.parseable_queries == 1
+    assert set(models) == {"orders"}
+
+
+def test_cte_aliases_are_not_treated_as_tables():
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    report = analyzer.analyze_queries(
+        [
+            """
+            WITH recent AS (SELECT * FROM orders WHERE order_date >= '2025-01-01')
+            SELECT status, SUM(amount) FROM recent GROUP BY status
+            """
+        ]
+    )
+    models = analyzer.generate_models(report)
+
+    assert "recent" not in models
+    assert "orders" in models
+
+
+def test_subquery_where_does_not_leak_into_filters():
+    """Inner predicates re-applied at the outer level would change the result set."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    report = analyzer.analyze_queries(
+        [
+            """
+            SELECT status, SUM(amount)
+            FROM orders
+            WHERE customer_id IN (SELECT id FROM customers WHERE region = 'US')
+            GROUP BY status
+            """
+        ]
+    )
+
+    analysis = report.query_analyses[0]
+    # Exactly one top-level filter: the IN predicate. The inner WHERE must not
+    # surface as a second standalone filter (it may appear inside the IN text).
+    assert len(analysis.filters) == 1
+    assert analysis.filters[0].startswith("customer_id IN")
+
+
+def test_count_star_not_covered_by_count_column_metric():
+    """COUNT(*) and COUNT(col) differ on NULLs; one must not satisfy the other."""
+    from sidemantic import Dimension, Metric, Model
+
+    layer = SemanticLayer(auto_register=False)
+    layer.graph.add_model(
+        Model(
+            name="orders",
+            table="orders",
+            dimensions=[Dimension(name="status", sql="status", type="categorical")],
+            metrics=[Metric(name="cust_count", agg="count", sql="customer_id")],
+        )
+    )
+    analyzer = Migrator(layer)
+
+    report = analyzer.analyze_queries(["SELECT status, COUNT(*) FROM orders GROUP BY status"])
+    analysis = report.query_analyses[0]
+
+    assert ("orders", "count", "*") in analysis.missing_metrics
+    assert not analysis.can_rewrite
+
+
+def test_no_relationship_from_non_key_equality():
+    """An arbitrary col = col correlation is not evidence of a relationship."""
+    layer = SemanticLayer(auto_register=False)
+    analyzer = Migrator(layer)
+
+    report = analyzer.analyze_queries(
+        [
+            """
+            SELECT o.status, SUM(o.amount)
+            FROM orders o, customers c
+            WHERE o.code = c.code
+            GROUP BY o.status
+            """
+        ]
+    )
+
+    assert report.query_analyses[0].relationships == []
+
+
+def test_split_sql_statements_respects_literals_and_comments():
+    from sidemantic.core.migrator import split_sql_statements
+
+    content = """
+    -- sidemantic: models=orders metrics=orders.revenue
+    SELECT * FROM orders WHERE note = 'a;b';
+    /* block; comment */
+    SELECT * FROM customers;
+    """
+    statements = split_sql_statements(content)
+
+    assert len(statements) == 2
+    assert "'a;b'" in statements[0]
+    assert "-- sidemantic:" in statements[0]
+    assert statements[1].startswith("/* block; comment */")

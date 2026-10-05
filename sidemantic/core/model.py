@@ -1,17 +1,20 @@
 """Model definitions."""
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from sidemantic.core.dimension import Dimension
+from sidemantic.core.governance import GovernedObject
 from sidemantic.core.metric import Metric
 from sidemantic.core.pre_aggregation import PreAggregation
 from sidemantic.core.relationship import Relationship
+from sidemantic.core.schema_exposure import SchemaExposure
+from sidemantic.core.security import SecurityPolicy
 from sidemantic.core.segment import Segment
 
 
-class Model(BaseModel):
+class Model(GovernedObject):
     """Model (dataset) definition.
 
     Models are the foundation of the semantic layer, mapping to physical tables
@@ -21,19 +24,33 @@ class Model(BaseModel):
     name: str = Field(..., description="Unique model name")
     table: str | None = Field(None, description="Physical table name (schema.table)")
     sql: str | None = Field(None, description="SQL expression for derived tables")
+    dax: str | None = Field(None, description="DAX table expression source text")
+    expression_language: Literal["sql", "dax"] | None = Field(
+        None, description="Expression language for sql/dax derived table authoring"
+    )
     source_uri: str | None = Field(None, description="Remote data source URI (e.g., https://, s3://, gs://)")
     description: str | None = Field(None, description="Human-readable description")
     extends: str | None = Field(None, description="Parent model to inherit from")
+    metadata: dict[str, Any] | None = Field(None, description="Adapter-specific metadata payload")
 
     # Relationships
     relationships: list[Relationship] = Field(default_factory=list, description="Relationships to other models")
 
-    # Primary key (required)
-    primary_key: str = Field(default="id", description="Primary key column")
+    # Primary key - single column or list for composite keys. None means "no known primary key".
+    # Keys are never inferred here: callers and adapters must preserve the source model's actual
+    # declaration rather than manufacturing an ``id`` column that may not exist.
+    primary_key: str | list[str] | None = Field(default=None, description="Primary key column(s), if known")
+
+    # Unique key constraints
+    unique_keys: list[list[str]] | None = Field(None, description="Unique key constraints (each is a list of columns)")
 
     dimensions: list[Dimension] = Field(default_factory=list, description="Dimension definitions")
     metrics: list[Metric] = Field(default_factory=list, description="Measure definitions")
     segments: list[Segment] = Field(default_factory=list, description="Segment (named filter) definitions")
+    invariant_filters: list[str] = Field(
+        default_factory=list,
+        description="SQL predicates that always constrain this model before joins and aggregation",
+    )
     pre_aggregations: list[PreAggregation] = Field(
         default_factory=list, description="Pre-aggregation definitions for query optimization"
     )
@@ -42,8 +59,26 @@ class Model(BaseModel):
     default_time_dimension: str | None = Field(
         None, description="Default time dimension for metrics (auto-included in queries)"
     )
-    default_grain: Literal["hour", "day", "week", "month", "quarter", "year"] | None = Field(
+    default_grain: Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"] | None = Field(
         None, description="Default time granularity when using default_time_dimension"
+    )
+    # Auto-discover dimensions from database schema
+    auto_dimensions: bool = Field(
+        default=False,
+        description="Auto-discover dimensions from database schema when added to a SemanticLayer",
+    )
+    schema_exposure: SchemaExposure | None = Field(
+        default=None,
+        description="Optional strict schema-introspection and physical-column visibility controls",
+    )
+
+    # Arbitrary metadata (ai_context, custom_extensions, etc.)
+    meta: dict[str, Any] | None = Field(None, description="Arbitrary metadata for extensions")
+
+    # Access control and row-level security policy. When set, queries touching this model are
+    # subject to an access gate and per-request row filters enforced in the compile/query path.
+    security: SecurityPolicy | None = Field(
+        None, description="Model-level access control and row-level security policy"
     )
 
     def __init__(self, **data):
@@ -56,6 +91,24 @@ class Model(BaseModel):
 
     def __hash__(self) -> int:
         return hash(self.name)
+
+    @property
+    def primary_key_columns(self) -> list[str]:
+        """Get primary key as list of columns (normalizes single string to list).
+
+        Returns an empty list when the model has no known primary key (``primary_key is None``),
+        so keyed-join logic naturally injects no key column for such a model.
+        """
+        if self.primary_key is None:
+            return []
+        if isinstance(self.primary_key, str):
+            return [self.primary_key]
+        return self.primary_key
+
+    @property
+    def has_untranslated_dax(self) -> bool:
+        """Whether this model preserves DAX source without a SQL/table translation."""
+        return bool(self.dax) and not self.sql and not self.table
 
     def get_dimension(self, name: str) -> Dimension | None:
         """Get dimension by name."""
@@ -104,9 +157,13 @@ class Model(BaseModel):
 
         path = [dimension_name]
 
-        # Walk up the parent chain
-        current = dim
+        # Walk up the parent chain with cycle detection
+        current: Dimension | None = dim
+        visited = {dimension_name}
         while current and current.parent:
+            if current.parent in visited:
+                break
+            visited.add(current.parent)
             path.insert(0, current.parent)
             current = self.get_dimension(current.parent)
 

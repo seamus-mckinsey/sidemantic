@@ -13,13 +13,35 @@ class Dimension(BaseModel):
 
     name: str = Field(..., description="Unique dimension name within model")
     type: Literal["categorical", "time", "boolean", "numeric"] = Field(..., description="Dimension type")
+    logical_data_type: str | None = Field(
+        None,
+        exclude=True,
+        description="Source logical data type, independent of the effective runtime dimension type",
+    )
+    declared_is_time: bool | None = Field(
+        None,
+        exclude=True,
+        description="Source-declared temporal role; None preserves an omitted declaration",
+    )
     sql: str | None = Field(None, description="SQL expression (defaults to name; accepts 'expr' as alias)")
+    dax: str | None = Field(None, description="DAX expression source text")
+    expression_language: Literal["sql", "dax"] | None = Field(
+        None, description="Expression language for sql/expr/dax authoring"
+    )
     granularity: Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"] | None = Field(
         None, description="Base granularity for time dimensions"
     )
     supported_granularities: list[str] | None = Field(None, description="Supported granularities for time dimensions")
     description: str | None = Field(None, description="Human-readable description")
     label: str | None = Field(None, description="Display label")
+    metadata: dict[str, Any] | None = Field(None, description="Adapter-specific metadata payload")
+
+    # Synonyms / sample values (e.g. Snowflake Cortex Analyst, Cube)
+    synonyms: list[str] | None = Field(None, description="Alternative names for this dimension")
+    sample_values: list[str] | None = Field(None, description="Representative sample values for this dimension")
+    cortex_search_service_name: str | None = Field(
+        None, description="Linked Cortex Search service name (Snowflake Cortex Analyst)"
+    )
 
     # Display formatting
     format: str | None = Field(None, description="Display format string (e.g., '$#,##0.00', '0.00%')")
@@ -27,6 +49,21 @@ class Dimension(BaseModel):
 
     # Hierarchy
     parent: str | None = Field(None, description="Parent dimension for hierarchies (e.g., 'state' parent is 'country')")
+
+    # Arbitrary metadata (ai_context, custom_extensions, etc.)
+    meta: dict[str, Any] | None = Field(None, description="Arbitrary metadata for extensions")
+
+    # Window function expression
+    window: str | None = Field(
+        None,
+        description="Window function expression (e.g., 'LEAD(event) OVER (PARTITION BY person_id ORDER BY timestamp)')",
+    )
+
+    # Visibility
+    public: bool = Field(True, description="Whether dimension is visible in API/UI")
+
+    # Rendering hint (metadata only; no SQL generation impact)
+    uri: bool = Field(False, description="Whether this dimension's values should be rendered as links in UIs")
 
     @model_validator(mode="before")
     @classmethod
@@ -61,7 +98,27 @@ class Dimension(BaseModel):
 
     @property
     def sql_expr(self) -> str:
-        """Get SQL expression, defaulting to name if not specified."""
+        """Get the base SQL expression, defaulting to name if not specified.
+
+        Always returns the row-level expression (``sql`` or ``name``), never the
+        window function.  Use ``window_sql_expr`` when you need the window
+        expression for CTE projection.
+        """
+        return self.sql or self.name
+
+    @property
+    def has_untranslated_dax(self) -> bool:
+        """Whether this dimension preserves DAX source without a SQL translation."""
+        return self.expression_language == "dax" and bool(self.dax) and not self.sql
+
+    @property
+    def window_sql_expr(self) -> str:
+        """Get the window SQL expression if set, otherwise fall back to sql_expr.
+
+        Use this in CTE SELECT lists where window functions should be projected.
+        """
+        if self.window:
+            return self.window
         return self.sql or self.name
 
     def with_granularity(self, granularity: str) -> str:

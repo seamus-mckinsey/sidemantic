@@ -1,13 +1,60 @@
 """Generate JSON Schema from Pydantic models for YAML editor completion."""
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
+from sidemantic.core.consumption import Explore, SavedQuery
 from sidemantic.core.dimension import Dimension
+from sidemantic.core.freshness import Freshness
 from sidemantic.core.metric import Metric
 from sidemantic.core.model import Model
 from sidemantic.core.parameter import Parameter
 from sidemantic.core.relationship import Relationship
+from sidemantic.core.segment import Segment
+from sidemantic.core.table_calculation import TableCalculation
+
+
+def add_native_relationship_aliases(schema: dict) -> dict:
+    """Expose native YAML relationship aliases that map to Python API fields."""
+    properties = schema.setdefault("properties", {})
+
+    if "foreign_key" in properties and "foreign_key_columns" not in properties:
+        foreign_key_columns = deepcopy(properties["foreign_key"])
+        foreign_key_columns["title"] = "Foreign Key Columns"
+        foreign_key_columns["description"] = "Explicit source-column list (alias for foreign_key)"
+        properties["foreign_key_columns"] = foreign_key_columns
+
+    if "primary_key" in properties and "primary_key_columns" not in properties:
+        primary_key_columns = deepcopy(properties["primary_key"])
+        primary_key_columns["title"] = "Primary Key Columns"
+        primary_key_columns["description"] = "Explicit target-column list (alias for primary_key)"
+        properties["primary_key_columns"] = primary_key_columns
+
+    if "sql" not in properties:
+        properties["sql"] = {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "default": None,
+            "description": "Custom join SQL using {from} and {to} runtime placeholders",
+            "title": "Sql",
+        }
+
+    return schema
+
+
+def patch_relationship_schemas(schema: dict) -> None:
+    """Patch every embedded Relationship schema emitted by Pydantic."""
+    if not isinstance(schema, dict):
+        return
+    if schema.get("title") == "Relationship":
+        add_native_relationship_aliases(schema)
+    for value in schema.values():
+        if isinstance(value, dict):
+            patch_relationship_schemas(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    patch_relationship_schemas(item)
 
 
 def generate_yaml_schema() -> dict:
@@ -42,14 +89,32 @@ def generate_yaml_schema() -> dict:
                 "items": parameter_schema,
             },
         },
-        "required": ["models"],
+        "anyOf": [{"required": [name]} for name in ("models", "explores", "saved_queries", "table_calculations")],
         "$defs": {
+            **model_schema.get("$defs", {}),
+            **metric_schema.get("$defs", {}),
+            **parameter_schema.get("$defs", {}),
             "Dimension": dimension_schema,
+            "Freshness": Freshness.model_json_schema(),
             "Metric": metric_schema,
             "Relationship": relationship_schema,
+            "Segment": Segment.model_json_schema(),
             "Parameter": parameter_schema,
         },
     }
+
+    for catalog, definition_type in (
+        ("explores", Explore),
+        ("saved_queries", SavedQuery),
+        ("table_calculations", TableCalculation),
+    ):
+        item_schema = definition_type.model_json_schema()
+        # Native authoring rejects unknown fields even for permissive API models.
+        item_schema["additionalProperties"] = False
+        schema["$defs"].update(item_schema.pop("$defs", {}))
+        schema["properties"][catalog] = {"type": "array", "items": item_schema}
+
+    patch_relationship_schemas(schema)
 
     return schema
 

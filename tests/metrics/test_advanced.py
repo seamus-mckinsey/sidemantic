@@ -1,6 +1,7 @@
 """Test advanced metric features: grain-to-date, fill_nulls_with, offsets, conversion."""
 
 import duckdb
+import pytest
 
 from sidemantic.core.dimension import Dimension
 from sidemantic.core.metric import Metric
@@ -139,6 +140,37 @@ def test_fill_nulls_with_zero():
     assert pending[1] == 0  # Filled with 0 instead of NULL!
 
 
+@pytest.mark.parametrize(
+    ("source", "filters", "expected_ratio"),
+    [
+        ("SELECT CAST(NULL AS INTEGER) AS amount", None, 0.1),
+        ("SELECT 10 AS amount", ["amount < 0"], 0.1),
+        ("SELECT 10 AS amount WHERE false", None, 0),
+    ],
+)
+def test_model_measure_null_fill_applies_to_direct_and_dependent_metrics(source, filters, expected_ratio):
+    graph = SemanticGraph()
+    graph.add_model(
+        Model(
+            name="orders",
+            sql=source,
+            metrics=[
+                Metric(name="total", agg="sum", sql="amount", filters=filters, fill_nulls_with=10),
+                Metric(name="twice", type="derived", sql="total * 2"),
+                Metric(name="rows", agg="count"),
+                Metric(name="rate", type="ratio", numerator="rows", denominator="total"),
+            ],
+        )
+    )
+    sql = SQLGenerator(graph).generate(metrics=["orders.total", "orders.twice", "orders.rate"])
+
+    with duckdb.connect(":memory:") as conn:
+        total, twice, rate = conn.execute(sql).fetchone()
+
+    assert (total, twice) == (10, 20)
+    assert rate == pytest.approx(expected_ratio)
+
+
 def test_fill_nulls_with_string():
     """Test fill_nulls_with with string default."""
     products = Model(
@@ -167,6 +199,38 @@ def test_fill_nulls_with_string():
     # Without fill_nulls, grade is NULL
     gadget = [r for r in rows if r[0] == "Gadget"][0]
     assert gadget[1] is None
+
+
+def test_cumulative_fill_nulls_applies_after_window():
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT DATE '2024-01-01' AS day, NULL::INTEGER AS amount
+            UNION ALL SELECT DATE '2024-01-02', 5
+        """,
+        primary_key="day",
+        dimensions=[Dimension(name="day", sql="day", type="time", granularity="day")],
+        metrics=[Metric(name="amount", agg="sum", sql="amount")],
+    )
+    running_amount = Metric(
+        name="running_amount",
+        type="cumulative",
+        sql="sales.amount",
+        fill_nulls_with=0,
+    )
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(running_amount)
+
+    sql = SQLGenerator(graph).generate(
+        metrics=["running_amount"],
+        dimensions=["sales.day"],
+        order_by=["sales.day"],
+    )
+    rows = df_rows(duckdb.connect(":memory:").execute(sql))
+
+    assert "COALESCE(SUM(base.amount) OVER" in sql
+    assert [row[2] for row in rows] == [0, 5]
 
 
 def test_offset_ratio_metric():
@@ -210,6 +274,9 @@ def test_offset_ratio_metric():
 
     print("Results:", rows)
 
+    # "1 month" on month-grain data maps to a 1-row LAG
+    assert "LAG(base.revenue, 1)" in sql
+
     # Results are (month, revenue, mom_growth)
     # First month has no prior data (NULL)
     # Feb: 150 / 100 = 1.5
@@ -219,6 +286,175 @@ def test_offset_ratio_metric():
     assert abs(rows[1][2] - 1.5) < 0.01  # Feb
     assert abs(rows[2][2] - 1.333) < 0.01  # Mar
     assert abs(rows[3][2] - 0.9) < 0.01  # Apr
+
+
+def test_offset_ratio_fill_nulls_applies_to_missing_prior_period():
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT DATE '2024-01-01' AS month, 100 AS revenue
+            UNION ALL SELECT DATE '2024-02-01', 150
+        """,
+        primary_key="month",
+        dimensions=[Dimension(name="month", sql="month", type="time", granularity="month")],
+        metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
+    )
+    growth = Metric(
+        name="growth",
+        type="ratio",
+        numerator="sales.revenue",
+        denominator="sales.revenue",
+        offset_window="1 month",
+        fill_nulls_with=0,
+    )
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(growth)
+
+    sql = SQLGenerator(graph).generate(metrics=["growth"], dimensions=["sales.month"])
+    rows = df_rows(duckdb.connect(":memory:").execute(sql))
+
+    assert "COALESCE(" in sql
+    assert rows[0][2] == 0
+    assert abs(rows[1][2] - 1.5) < 0.01
+
+
+def test_offset_ratio_metric_multi_period():
+    """Ratio metric with a multi-period offset_window honors the interval."""
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT '2024-01'::VARCHAR AS month, 100 AS revenue
+            UNION ALL SELECT '2024-02', 150
+            UNION ALL SELECT '2024-03', 200
+            UNION ALL SELECT '2024-04', 180
+            UNION ALL SELECT '2024-05', 220
+            UNION ALL SELECT '2024-06', 240
+        """,
+        primary_key="month",
+        dimensions=[Dimension(name="month", sql="month", type="time")],
+        metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
+    )
+
+    # 3-month offset: current / value 3 months ago
+    growth = Metric(
+        name="growth",
+        type="ratio",
+        numerator="sales.revenue",
+        denominator="sales.revenue",
+        offset_window="3 months",
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(growth)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["growth"], dimensions=["sales.month"])
+
+    # "3 months" on month-grain data maps to a 3-row LAG
+    assert "LAG(base.revenue, 3)" in sql
+
+    conn = duckdb.connect(":memory:")
+    rows = df_rows(conn.execute(sql))
+
+    # Results are (month, revenue, growth)
+    # Jan/Feb/Mar have no 3-row lookback -> None
+    # Apr: 180 / 100 = 1.8
+    # May: 220 / 150 = 1.4667
+    # Jun: 240 / 200 = 1.2
+    assert rows[0][2] is None  # Jan
+    assert rows[1][2] is None  # Feb
+    assert rows[2][2] is None  # Mar
+    assert abs(rows[3][2] - 1.8) < 0.01  # Apr
+    assert abs(rows[4][2] - 1.4667) < 0.01  # May
+    assert abs(rows[5][2] - 1.2) < 0.01  # Jun
+
+
+def test_offset_ratio_metric_uses_base_granularity():
+    """offset_window honors a dimension's own granularity even without a __gran suffix."""
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT DATE '2024-01-01' AS day, 100 AS revenue
+            UNION ALL SELECT DATE '2024-01-02', 110
+            UNION ALL SELECT DATE '2024-01-03', 120
+            UNION ALL SELECT DATE '2024-01-04', 130
+            UNION ALL SELECT DATE '2024-01-05', 140
+            UNION ALL SELECT DATE '2024-01-06', 150
+            UNION ALL SELECT DATE '2024-01-07', 160
+            UNION ALL SELECT DATE '2024-01-08', 200
+        """,
+        primary_key="day",
+        dimensions=[Dimension(name="day", sql="day", type="time", granularity="day")],
+        metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
+    )
+
+    growth = Metric(
+        name="growth",
+        type="ratio",
+        numerator="sales.revenue",
+        denominator="sales.revenue",
+        offset_window="7 days",
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(growth)
+
+    generator = SQLGenerator(graph)
+    # Query the base time dimension WITHOUT an explicit __day suffix.
+    sql = generator.generate(metrics=["growth"], dimensions=["sales.day"])
+
+    assert "RANGE BETWEEN INTERVAL '7 day' PRECEDING AND INTERVAL '7 day' PRECEDING" in sql
+
+    conn = duckdb.connect(":memory:")
+    rows = df_rows(conn.execute(sql))
+    # Day 8 (200) / day 1 (100) = 2.0
+    assert abs(rows[7][2] - 2.0) < 0.01
+
+
+def test_offset_ratio_metric_year_offset():
+    """A '1 year' offset_window over 6 months of monthly data yields all NULLs."""
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT '2024-01'::VARCHAR AS month, 100 AS revenue
+            UNION ALL SELECT '2024-02', 150
+            UNION ALL SELECT '2024-03', 200
+            UNION ALL SELECT '2024-04', 180
+            UNION ALL SELECT '2024-05', 220
+            UNION ALL SELECT '2024-06', 240
+        """,
+        primary_key="month",
+        dimensions=[Dimension(name="month", sql="month", type="time")],
+        metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
+    )
+
+    yoy = Metric(
+        name="yoy",
+        type="ratio",
+        numerator="sales.revenue",
+        denominator="sales.revenue",
+        offset_window="1 year",
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(yoy)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["yoy"], dimensions=["sales.month"])
+
+    # "1 year" on month-grain data maps to a 12-row LAG
+    assert "LAG(base.revenue, 12)" in sql
+
+    conn = duckdb.connect(":memory:")
+    rows = df_rows(conn.execute(sql))
+
+    # No 12-row lookback exists in 6 rows -> every growth value is None
+    for row in rows:
+        assert row[2] is None
 
 
 def test_conversion_metric():
@@ -360,7 +596,8 @@ def test_mom_difference():
             UNION ALL SELECT '2024-04', 180
         """,
         primary_key="month",
-        dimensions=[Dimension(name="month", sql="month", type="time")],
+        # Give the source month label an explicit calendar date for MoM lookup.
+        dimensions=[Dimension(name="calendar_month", sql="CAST(month || '-01' AS DATE)", type="time")],
         metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
     )
 
@@ -379,7 +616,7 @@ def test_mom_difference():
     graph.add_metric(revenue_mom)
 
     generator = SQLGenerator(graph)
-    sql = generator.generate(metrics=["revenue_mom_change"], dimensions=["sales.month"])
+    sql = generator.generate(metrics=["revenue_mom_change"], dimensions=["sales.calendar_month"])
 
     print("\nMoM Difference SQL:")
     print(sql)
@@ -400,6 +637,69 @@ def test_mom_difference():
     assert rows[1][2] == 50  # Feb
     assert rows[2][2] == -30  # Mar
     assert rows[3][2] == 60  # Apr
+
+
+def test_time_comparison_fill_nulls_applies_to_missing_prior_period():
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT DATE '2024-01-01' AS month, 100 AS revenue
+            UNION ALL SELECT DATE '2024-02-01', 150
+        """,
+        primary_key="month",
+        dimensions=[Dimension(name="month", sql="month", type="time", granularity="month")],
+        metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
+    )
+    change = Metric(
+        name="change",
+        type="time_comparison",
+        base_metric="sales.revenue",
+        comparison_type="mom",
+        calculation="difference",
+        fill_nulls_with=0,
+    )
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(change)
+
+    sql = SQLGenerator(graph).generate(metrics=["change"], dimensions=["sales.month"])
+    rows = df_rows(duckdb.connect(":memory:").execute(sql))
+
+    assert "COALESCE((revenue - change_prev_value), 0)" in sql
+    assert [row[2] for row in rows] == [0, 50]
+
+
+def test_month_comparison_does_not_use_previous_available_sparse_row():
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT DATE '2024-01-01' AS sale_date, 100 AS revenue
+            UNION ALL SELECT DATE '2024-03-01', 180
+        """,
+        primary_key="sale_date",
+        dimensions=[Dimension(name="sale_date", sql="sale_date", type="time")],
+        metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
+    )
+    comparison = Metric(
+        name="revenue_mom",
+        type="time_comparison",
+        base_metric="sales.revenue",
+        comparison_type="mom",
+        calculation="difference",
+    )
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(comparison)
+
+    sql = SQLGenerator(graph).generate(
+        metrics=["revenue_mom"],
+        dimensions=["sales.sale_date__month"],
+    )
+    rows = df_rows(duckdb.connect(":memory:").execute(sql))
+
+    assert "RANGE BETWEEN INTERVAL '1 month' PRECEDING AND INTERVAL '1 month' PRECEDING" in sql
+    assert rows[1][0].isoformat() == "2024-03-01"
+    assert rows[1][2] is None
 
 
 def test_dotted_metric_name_alias():
@@ -513,3 +813,1108 @@ def test_wow_ratio():
     assert abs(rows[1][2] - 1.5) < 0.01  # Week 2
     assert abs(rows[2][2] - 0.8) < 0.01  # Week 3
     assert abs(rows[3][2] - 1.5) < 0.01  # Week 4
+
+
+def test_wow_percent_change_partitions_by_dimension():
+    """Test WoW percent change partitions by non-time dimensions."""
+    sales = Model(
+        name="sales",
+        sql="""
+            SELECT 1 AS id, 'A' AS campaign, '2024-01-01'::DATE AS sale_date, 100 AS revenue
+            UNION ALL SELECT 2, 'A', '2024-01-08'::DATE, 150
+            UNION ALL SELECT 3, 'B', '2024-01-01'::DATE, 200
+            UNION ALL SELECT 4, 'B', '2024-01-08'::DATE, 100
+        """,
+        primary_key="id",
+        dimensions=[
+            Dimension(name="campaign", sql="campaign", type="categorical"),
+            Dimension(name="sale_date", sql="sale_date", type="time"),
+        ],
+        metrics=[Metric(name="revenue", agg="sum", sql="revenue")],
+    )
+
+    revenue_wow_pct = Metric(
+        name="revenue_wow_pct",
+        type="time_comparison",
+        base_metric="sales.revenue",
+        comparison_type="wow",
+        calculation="percent_change",
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(sales)
+    graph.add_metric(revenue_wow_pct)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(
+        metrics=["revenue_wow_pct"],
+        dimensions=["sales.campaign", "sales.sale_date__week"],
+        order_by=["sales.campaign", "sales.sale_date__week"],
+    )
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # Campaign A: 100 -> 150 => +50%
+    assert rows[0][0] == "A"
+    assert rows[0][3] is None
+    assert rows[1][0] == "A"
+    assert abs(rows[1][3] - 50.0) < 0.1
+
+    # Campaign B: 200 -> 100 => -50%
+    assert rows[2][0] == "B"
+    assert rows[2][3] is None
+    assert rows[3][0] == "B"
+    assert abs(rows[3][3] - (-50.0)) < 0.1
+
+
+def test_multistep_conversion_funnel():
+    """Test N-step conversion funnel metric with timestamp-aware chronological ordering."""
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS person_id, 'Application Installed' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'note.opened', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 1, 'note.created', '2024-01-03'::TIMESTAMP
+            UNION ALL SELECT 1, 'git.sync', '2024-01-04'::TIMESTAMP
+            UNION ALL SELECT 2, 'Application Installed', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 2, 'note.opened', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'note.created', '2024-01-03'::TIMESTAMP
+            UNION ALL SELECT 3, 'Application Installed', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'note.opened', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 4, 'Application Installed', '2024-01-01'::TIMESTAMP
+        """,
+        primary_key="person_id",
+        dimensions=[
+            Dimension(name="person_id", sql="person_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    activation_funnel = Metric(
+        name="activation_funnel",
+        type="conversion",
+        entity="person_id",
+        steps=[
+            "event = 'Application Installed'",
+            "event = 'note.opened'",
+            "event = 'note.created'",
+            "event = 'git.sync'",
+        ],
+        description="4-step activation funnel",
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(activation_funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["activation_funnel"], dimensions=[])
+
+    print("\nMulti-step Conversion SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    print("Results:", rows)
+
+    # 4 entities total
+    # Step 1 (Application Installed): persons 1,2,3,4 = 4
+    # Step 2 (note.opened): persons 1,2,3 = 3
+    # Step 3 (note.created): persons 1,2 = 2
+    # Step 4 (git.sync): person 1 = 1
+    assert rows[0][0] == 4  # total_entities
+    assert rows[0][1] == 4  # step_1_count
+    assert rows[0][2] == 3  # step_2_count
+    assert rows[0][3] == 2  # step_3_count
+    assert rows[0][4] == 1  # step_4_count
+
+
+def test_multistep_conversion_2_steps_via_steps_list():
+    """Test that a 2-step funnel via steps list works the same as base_event/conversion_event."""
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', '2024-01-01'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="signup_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["signup_funnel"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # 3 total entities
+    # Step 1 (signup): 3
+    # Step 2 (purchase): 1
+    assert rows[0][0] == 3  # total_entities
+    assert rows[0][1] == 3  # step_1_count
+    assert rows[0][2] == 1  # step_2_count
+
+
+def test_conversion_metric_backwards_compatible():
+    """Test that existing base_event/conversion_event still works after adding steps support."""
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event_type, '2024-01-01'::DATE AS event_date
+            UNION ALL SELECT 1, 'purchase', '2024-01-03'::DATE
+            UNION ALL SELECT 2, 'signup', '2024-01-05'::DATE
+            UNION ALL SELECT 2, 'purchase', '2024-01-20'::DATE
+            UNION ALL SELECT 3, 'signup', '2024-01-10'::DATE
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event_type", sql="event_type", type="categorical"),
+            Dimension(name="event_date", sql="event_date", type="time"),
+        ],
+        metrics=[Metric(name="user_count", agg="count_distinct", sql="user_id")],
+    )
+
+    # Legacy 2-step conversion (same as existing test_conversion_metric)
+    signup_conversion = Metric(
+        name="signup_conversion",
+        type="conversion",
+        entity="user_id",
+        base_event="signup",
+        conversion_event="purchase",
+        conversion_window="7 days",
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(signup_conversion)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["signup_conversion"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # Same assertion as original test: 1/3 converted within 7 days
+    assert abs(rows[0][0] - 0.333) < 0.01
+
+
+def test_conversion_metric_steps_validation():
+    """Test validation: steps requires at least 2 entries."""
+    import pytest
+
+    with pytest.raises(ValueError, match="at least 2 steps"):
+        Metric(
+            name="bad_funnel",
+            type="conversion",
+            entity="user_id",
+            steps=["event = 'signup'"],
+        )
+
+
+def test_conversion_metric_steps_and_base_event():
+    """Test that steps takes precedence when both steps and base_event are provided."""
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS person_id, 'install' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'activate', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'install', '2024-01-01'::TIMESTAMP
+        """,
+        primary_key="person_id",
+        dimensions=[
+            Dimension(name="person_id", sql="person_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    # steps is provided, so base_event/conversion_event should be ignored
+    funnel = Metric(
+        name="test_funnel",
+        type="conversion",
+        entity="person_id",
+        base_event="install",
+        conversion_event="activate",
+        steps=[
+            "event = 'install'",
+            "event = 'activate'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["test_funnel"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # steps takes precedence: uses timestamp-aware pattern
+    assert rows[0][0] == 2  # total_entities
+    assert rows[0][1] == 2  # step_1_count (install)
+    assert rows[0][2] == 1  # step_2_count (activate)
+
+
+def test_conversion_metric_requires_entity():
+    """Test validation: conversion metric requires entity field."""
+    import pytest
+
+    with pytest.raises(ValueError, match="entity"):
+        Metric(
+            name="bad_funnel",
+            type="conversion",
+            steps=["event = 'a'", "event = 'b'"],
+        )
+
+
+def test_conversion_steps_and_conversion_window_rejected():
+    """Test validation: steps and conversion_window cannot be used together."""
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot specify both 'steps' and 'conversion_window'"):
+        Metric(
+            name="bad_funnel",
+            type="conversion",
+            entity="user_id",
+            steps=["event = 'a'", "event = 'b'"],
+            conversion_window="7 days",
+        )
+
+
+def test_multistep_funnel_monotonic_counts():
+    """Test that funnel step counts are monotonically decreasing.
+
+    An entity that triggers a later event without completing earlier steps
+    should not be counted at the later step.
+    """
+    # person 5 has step 3 event but NOT step 1 or 2 -> should not inflate step 3
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS person_id, 'install' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'activate', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 1, 'purchase', '2024-01-03'::TIMESTAMP
+            UNION ALL SELECT 2, 'install', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 2, 'activate', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 3, 'install', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 5, 'purchase', '2024-01-01'::TIMESTAMP
+        """,
+        primary_key="person_id",
+        dimensions=[
+            Dimension(name="person_id", sql="person_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="mono_funnel",
+        type="conversion",
+        entity="person_id",
+        steps=[
+            "event = 'install'",
+            "event = 'activate'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["mono_funnel"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # total_entities = step 1 entrants only: persons 1,2,3 = 3 (person 5 excluded)
+    assert rows[0][0] == 3  # total_entities
+    assert rows[0][1] == 3  # step_1_count: persons 1,2,3
+    assert rows[0][2] == 2  # step_2_count: persons 1,2 (had install AND activate)
+    assert rows[0][3] == 1  # step_3_count: person 1 only (had all 3 steps)
+
+    # Verify monotonicity
+    for i in range(1, len(rows[0]) - 1):
+        assert rows[0][i] >= rows[0][i + 1], (
+            f"Funnel not monotonic: step {i} ({rows[0][i]}) < step {i + 1} ({rows[0][i + 1]})"
+        )
+
+
+def test_multistep_funnel_total_excludes_non_entrants():
+    """Test that total_entities excludes entities who never entered step 1."""
+    # 4 entities in data, but only 2 satisfy step 1
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS uid, 'signup' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'browse', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 4, 'browse', '2024-01-01'::TIMESTAMP
+        """,
+        primary_key="uid",
+        dimensions=[
+            Dimension(name="uid", sql="uid", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="entry_funnel",
+        type="conversion",
+        entity="uid",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["entry_funnel"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # total_entities should be 2 (only users 1 and 2 who signed up), NOT 4
+    assert rows[0][0] == 2  # total_entities = step 1 entrants
+    assert rows[0][1] == 2  # step_1_count
+    assert rows[0][2] == 1  # step_2_count (only user 1 purchased)
+
+
+def test_multistep_funnel_chronological_order_enforced():
+    """Test that funnel steps must occur in chronological order.
+
+    An entity that does step 2 before step 1 should NOT count as having
+    completed step 2 in the funnel, even if both events exist.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', '2024-01-05'::TIMESTAMP
+            UNION ALL SELECT 2, 'purchase', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-10'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', '2024-01-01'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="ordered_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["ordered_funnel"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # User 1: signup(Jan 1) -> purchase(Jan 5) = chronological, counts
+    # User 2: purchase(Jan 1) -> signup(Jan 10) = REVERSED, does NOT count for step 2
+    # User 3: signup(Jan 1) only = step 1 only
+    # total_entities = 3 (all have signup)
+    # step_1_count = 3
+    # step_2_count = 1 (only user 1 has purchase AFTER signup)
+    assert rows[0][0] == 3  # total_entities
+    assert rows[0][1] == 3  # step_1_count
+    assert rows[0][2] == 1  # step_2_count (only user 1, NOT user 2)
+
+
+def test_multistep_funnel_qualified_filters():
+    """Test that model-qualified filters work with multistep funnels.
+
+    Filters like 'events.region = ...' should be normalized to 'region = ...'
+    for SQL-backed models using FROM (<sql>) AS t.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, 'US' AS region, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', 'US', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', 'US', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', 'EU', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'purchase', 'EU', '2024-01-02'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="region", sql="region", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="regional_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    # Use model-qualified filter: events.region = 'US'
+    sql = generator.generate(
+        metrics=["regional_funnel"],
+        dimensions=[],
+        filters=["events.region = 'US'"],
+    )
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # Only US users: user 1 (signup + purchase), user 2 (signup only)
+    # User 3 is EU, filtered out
+    assert rows[0][0] == 2  # total_entities (US users with signup)
+    assert rows[0][1] == 2  # step_1_count
+    assert rows[0][2] == 1  # step_2_count (only user 1 purchased)
+
+
+def test_filter_dimension_with_model_qualified_sql_expr():
+    """Test that dimension sql_expr with model-qualified refs doesn't break filters.
+
+    When a dimension's sql_expr is model-qualified (e.g., events.region),
+    _resolve_filter_dimensions must strip the model prefix so the expression
+    is valid inside FROM (<model.sql>) AS t subqueries.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, 'US' AS region, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', 'US', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', 'US', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', 'EU', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'purchase', 'EU', '2024-01-02'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            # sql_expr uses model-qualified reference
+            Dimension(name="region", sql="events.region", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="regional_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(
+        metrics=["regional_funnel"],
+        dimensions=[],
+        filters=["region = 'US'"],
+    )
+
+    # The resolved SQL should not contain events.region in a context
+    # where only alias t/s is valid
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # Only US users: user 1 (signup + purchase), user 2 (signup only)
+    assert rows[0][0] == 2  # total_entities
+    assert rows[0][1] == 2  # step_1_count
+    assert rows[0][2] == 1  # step_2_count
+
+
+def test_multistep_funnel_repeated_actions_valid_path():
+    """Test that repeated actions find a valid ordered path.
+
+    Entity does purchase at t1, signup at t2, purchase again at t3.
+    The old MIN(CASE WHEN ...) approach would compute step_1_ts (signup) = t2,
+    step_2_ts (purchase) = t1 (the global MIN), and fail t1 >= t2.
+    The sequential CTE chain correctly finds signup at t2, then purchase at t3.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'purchase' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'signup', '2024-01-05'::TIMESTAMP
+            UNION ALL SELECT 1, 'purchase', '2024-01-10'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 2, 'purchase', '2024-01-02'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="repeated_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["repeated_funnel"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # User 1: purchase(t1), signup(t5), purchase(t10) -> valid path exists: signup(t5)->purchase(t10)
+    # User 2: signup(t1), purchase(t2) -> valid path: signup(t1)->purchase(t2)
+    # Both users should be counted at step 2
+    assert rows[0][0] == 2  # total_entities
+    assert rows[0][1] == 2  # step_1_count (both signed up)
+    assert rows[0][2] == 2  # step_2_count (both have purchase AFTER signup)
+
+
+def test_multistep_funnel_only_prior_step2_not_counted():
+    """Test that an entity with step 2 ONLY before step 1 is NOT counted at step 2.
+
+    Entity does purchase at t1, signup at t5, but NO purchase after t5.
+    There is no valid ordered path for this entity.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'purchase' AS event, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'signup', '2024-01-05'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 2, 'purchase', '2024-01-02'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="nopath_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["nopath_funnel"], dimensions=[])
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # User 1: purchase(t1), signup(t5) -> no purchase after signup -> NOT counted at step 2
+    # User 2: signup(t1), purchase(t2) -> valid path -> counted at step 2
+    assert rows[0][0] == 2  # total_entities
+    assert rows[0][1] == 2  # step_1_count (both signed up)
+    assert rows[0][2] == 1  # step_2_count (only user 2)
+
+
+def test_multistep_funnel_expression_timestamp():
+    """Test that a time dimension using an expression works in step CTEs.
+
+    When the time dimension's sql_expr is something like CAST(ts AS DATE)
+    rather than a bare column name, the generated SQL must not produce
+    invalid fragments like s.CAST(ts AS DATE).  The generator should alias
+    the expression and reference the alias in later steps.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, '2024-01-01 10:00:00'::TIMESTAMP AS created_at
+            UNION ALL SELECT 1, 'purchase', '2024-01-02 14:00:00'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-01 08:00:00'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', '2024-01-01 09:00:00'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            # Expression-based time dimension (not a bare column)
+            Dimension(name="event_date", sql="CAST(created_at AS DATE)", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="expr_ts_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["expr_ts_funnel"], dimensions=[])
+
+    print("\nExpression timestamp funnel SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # User 1: signup -> purchase (valid path)
+    # User 2: signup only
+    # User 3: signup only
+    assert rows[0][0] == 3  # total_entities
+    assert rows[0][1] == 3  # step_1_count
+    assert rows[0][2] == 1  # step_2_count (only user 1)
+
+
+def test_multistep_funnel_or_step_with_filter():
+    """Test that step predicates containing OR are correctly parenthesized.
+
+    Without parenthesization, WHERE event = 'a' OR event = 'b' AND region = 'US'
+    would be parsed as event = 'a' OR (event = 'b' AND region = 'US'), which is
+    incorrect. The step predicate should be wrapped: WHERE (event = 'a' OR event = 'b')
+    AND region = 'US'.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'email_signup' AS event, 'US' AS region, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', 'US', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'social_signup', 'US', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 2, 'purchase', 'US', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 3, 'email_signup', 'EU', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'purchase', 'EU', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 4, 'social_signup', 'EU', '2024-01-01'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="region", sql="region", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="or_step_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'email_signup' OR event = 'social_signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    # Filter to US only
+    sql = generator.generate(
+        metrics=["or_step_funnel"],
+        dimensions=[],
+        filters=["region = 'US'"],
+    )
+
+    print("\nOR step with filter funnel SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # With correct parenthesization:
+    # Step 1: (event = 'email_signup' OR event = 'social_signup') AND region = 'US'
+    #   -> users 1 (email_signup, US), 2 (social_signup, US) = 2
+    #   User 3 is EU, user 4 is EU -> filtered out
+    # Step 2: (event = 'purchase') AND region = 'US'
+    #   -> users 1, 2 (both purchased in US) = 2
+    #
+    # Without parenthesization (the bug):
+    # Step 1: event = 'email_signup' OR (event = 'social_signup' AND region = 'US')
+    #   -> users 1 (email), 2 (social+US), 3 (email) = 3 (WRONG: user 3 EU leaks in)
+    assert rows[0][0] == 2  # total_entities (US signups only)
+    assert rows[0][1] == 2  # step_1_count
+    assert rows[0][2] == 2  # step_2_count (both US users purchased)
+
+
+def test_multistep_funnel_model_placeholder_timestamp():
+    """Test that {model}.col timestamps are rewritten for step source subqueries.
+
+    When a time dimension uses {model}.created_at as its SQL expression, the
+    generator must replace the placeholder with the correct alias inside each
+    step CTE. Otherwise the subquery references an undefined table.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, '2024-01-01 10:00:00'::TIMESTAMP AS created_at
+            UNION ALL SELECT 1, 'purchase', '2024-01-02 14:00:00'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-01 08:00:00'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', '2024-01-01 09:00:00'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            # Time dimension using {model} placeholder
+            Dimension(name="created_at", sql="{model}.created_at", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="placeholder_ts_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["placeholder_ts_funnel"], dimensions=[])
+
+    print("\n{model} placeholder timestamp funnel SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # User 1: signup -> purchase (valid path)
+    # User 2: signup only
+    # User 3: signup only
+    assert rows[0][0] == 3  # total_entities
+    assert rows[0][1] == 3  # step_1_count
+    assert rows[0][2] == 1  # step_2_count (only user 1)
+
+
+def test_multistep_funnel_model_placeholder_step_predicates():
+    """Test that {model}.col in step predicates is rewritten to the CTE source alias.
+
+    When step predicates use qualified syntax like {model}.event = 'X' or
+    events.event = 'X', the generator must rewrite these to the correct alias
+    (t for step 1, s for later steps) or strip the prefix for table models.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, '2024-01-01 10:00:00'::TIMESTAMP AS created_at
+            UNION ALL SELECT 1, 'purchase', '2024-01-02 14:00:00'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', '2024-01-01 08:00:00'::TIMESTAMP
+            UNION ALL SELECT 2, 'purchase', '2024-01-03 10:00:00'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', '2024-01-01 09:00:00'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="created_at", sql="created_at", type="time"),
+        ],
+    )
+
+    # Steps use {model}.event = '...' syntax
+    funnel = Metric(
+        name="qualified_step_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "{model}.event = 'signup'",
+            "{model}.event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["qualified_step_funnel"], dimensions=[])
+
+    print("\n{model} placeholder step predicates SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # User 1: signup -> purchase (valid path)
+    # User 2: signup -> purchase (valid path)
+    # User 3: signup only
+    assert rows[0][0] == 3  # total_entities
+    assert rows[0][1] == 3  # step_1_count
+    assert rows[0][2] == 2  # step_2_count (users 1 and 2)
+
+
+def test_multistep_funnel_model_name_prefix_step_predicates():
+    """Test that model-name prefixed step predicates (events.event) are normalized.
+
+    When step predicates use the model name directly (e.g., events.event = 'X'),
+    the prefix must be stripped or rewritten so the step CTE can resolve columns.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'install' AS event, '2024-01-01 10:00:00'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'activate', '2024-01-01 12:00:00'::TIMESTAMP
+            UNION ALL SELECT 1, 'purchase', '2024-01-02 14:00:00'::TIMESTAMP
+            UNION ALL SELECT 2, 'install', '2024-01-01 08:00:00'::TIMESTAMP
+            UNION ALL SELECT 2, 'activate', '2024-01-01 09:00:00'::TIMESTAMP
+            UNION ALL SELECT 3, 'install', '2024-01-01 09:00:00'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    # 3-step funnel using model-name prefix in predicates
+    funnel = Metric(
+        name="model_prefix_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "events.event = 'install'",
+            "events.event = 'activate'",
+            "events.event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    sql = generator.generate(metrics=["model_prefix_funnel"], dimensions=[])
+
+    print("\nModel-name prefix step predicates SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # User 1: install -> activate -> purchase (all 3 steps)
+    # User 2: install -> activate (2 steps only)
+    # User 3: install only
+    assert rows[0][0] == 3  # total_entities
+    assert rows[0][1] == 3  # step_1_count (all installed)
+    assert rows[0][2] == 2  # step_2_count (users 1,2 activated)
+    assert rows[0][3] == 1  # step_3_count (only user 1 purchased)
+
+
+def test_multistep_funnel_model_placeholder_filter():
+    """Test that {model}.col in query filters is resolved before stripping.
+
+    When a filter uses {model}.region = 'US', the {model} placeholder must be
+    resolved to the actual model name before sqlglot parsing, otherwise the
+    parse fails and the literal {model} leaks into the WHERE clause.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, 'US' AS region, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', 'US', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', 'US', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', 'EU', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'purchase', 'EU', '2024-01-02'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="region", sql="region", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="placeholder_filter_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    # Use {model}.region filter: should be resolved to events.region then stripped
+    sql = generator.generate(
+        metrics=["placeholder_filter_funnel"],
+        dimensions=[],
+        filters=["{model}.region = 'US'"],
+    )
+
+    print("\n{model} placeholder filter SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    # Only US users: user 1 (signup + purchase), user 2 (signup only)
+    # User 3 is EU, filtered out
+    assert rows[0][0] == 2  # total_entities
+    assert rows[0][1] == 2  # step_1_count
+    assert rows[0][2] == 1  # step_2_count (only user 1 purchased)
+
+
+def test_multistep_funnel_order_by_metric_name():
+    """Test that order_by referencing the metric name works.
+
+    The multistep funnel output must include a column aliased to the metric name
+    so that ORDER BY metric_name does not fail with a missing-column error.
+    """
+    events = Model(
+        name="events",
+        sql="""
+            SELECT 1 AS user_id, 'signup' AS event, 'US' AS region, '2024-01-01'::TIMESTAMP AS ts
+            UNION ALL SELECT 1, 'purchase', 'US', '2024-01-02'::TIMESTAMP
+            UNION ALL SELECT 2, 'signup', 'US', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'signup', 'EU', '2024-01-01'::TIMESTAMP
+            UNION ALL SELECT 3, 'purchase', 'EU', '2024-01-02'::TIMESTAMP
+        """,
+        primary_key="user_id",
+        dimensions=[
+            Dimension(name="user_id", sql="user_id", type="categorical"),
+            Dimension(name="event", sql="event", type="categorical"),
+            Dimension(name="region", sql="region", type="categorical"),
+            Dimension(name="ts", sql="ts", type="time"),
+        ],
+    )
+
+    funnel = Metric(
+        name="activation_funnel",
+        type="conversion",
+        entity="user_id",
+        steps=[
+            "event = 'signup'",
+            "event = 'purchase'",
+        ],
+    )
+
+    graph = SemanticGraph()
+    graph.add_model(events)
+    graph.add_metric(funnel)
+
+    generator = SQLGenerator(graph)
+    # Group by region and order by metric name
+    sql = generator.generate(
+        metrics=["activation_funnel"],
+        dimensions=["events.region"],
+        order_by=["activation_funnel DESC"],
+    )
+
+    print("\nOrder by metric name SQL:")
+    print(sql)
+
+    conn = duckdb.connect(":memory:")
+    result = conn.execute(sql)
+    rows = df_rows(result)
+
+    print("Results:", rows)
+
+    # 2 regions: EU (1 signup, 1 purchase), US (2 signups, 1 purchase)
+    # activation_funnel is the last-step count, used for ordering DESC
+    assert len(rows) == 2
+    # Both execute without error, confirming the metric-named column exists
+    for row in rows:
+        assert row[0] in ("US", "EU")  # region

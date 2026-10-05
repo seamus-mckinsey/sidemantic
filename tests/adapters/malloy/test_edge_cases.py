@@ -2,7 +2,22 @@
 
 from pathlib import Path
 
-from sidemantic.adapters.malloy import MalloyAdapter
+from sidemantic.adapters.malloy import MalloyAdapter, MalloyModelVisitor
+
+
+def test_expression_transforms_ignore_malloy_syntax_inside_strings():
+    transform = MalloyModelVisitor()._transform_malloy_expr
+
+    assert transform("'@2024-01-01'") == "'@2024-01-01'"
+    assert transform("note = '@2024-01-01'") == "note = '@2024-01-01'"
+    assert transform("'timestamp_seconds!timestamp(x)'") == "'timestamp_seconds!timestamp(x)'"
+    assert transform("note = '@2024-01-01' AND created_at >= @2024-01-01") == (
+        "note = '@2024-01-01' AND created_at >= DATE '2024-01-01'"
+    )
+    assert transform("timestamp_seconds!timestamp(x)") == "timestamp_seconds(x)"
+    assert transform("\"name ~ r'x'\"") == "\"name ~ r'x'\""
+    assert transform("note ? 'a | b' | 'c'") == "note IN ('a | b', 'c')"
+    assert transform(r"name ~ r'a\'b'") == r"REGEXP_MATCHES(name, 'a\''b')"
 
 
 class TestEdgeCases:
@@ -96,9 +111,26 @@ class TestEdgeCases:
         assert "join_target_b" in rels
         assert rels["join_target_b"].type == "one_to_many"
 
-        # join_cross -> one_to_one (our mapping)
+        # join_cross -> cross (real CROSS JOIN / cartesian product)
         assert "join_target_c" in rels
-        assert rels["join_target_c"].type == "one_to_one"
+        assert rels["join_target_c"].type == "cross"
+
+    def test_join_direction_stored(self):
+        """Test that join direction modifiers (LEFT, INNER, etc.) are stored in metadata."""
+        directed = self.graph.get_model("directed_joins")
+        assert directed is not None
+        assert len(directed.relationships) == 1
+
+        rels = {r.name: r for r in directed.relationships}
+
+        # join_one with left
+        assert "join_target_a" in rels
+        assert rels["join_target_a"].type == "many_to_one"
+        assert rels["join_target_a"].metadata is not None
+        assert rels["join_target_a"].metadata.get("join_direction") == "left"
+
+        # Non-default INNER semantics cannot be represented and are omitted.
+        assert "join_target_b" not in rels
 
     def test_bare_minimum_source(self):
         """Test source with only primary_key (no dimensions/measures)."""
@@ -109,17 +141,14 @@ class TestEdgeCases:
         assert len(bare.dimensions) == 0
         assert len(bare.metrics) == 0
 
-    def test_filtered_source_creates_segment(self):
-        """Test that source-level where creates a segment."""
+    def test_filtered_source_creates_invariant_filters(self):
+        """Source-level where predicates are intrinsic, not opt-in segments."""
         filtered = self.graph.get_model("filtered_source")
         assert filtered is not None
 
-        # Should have segments from where clause
-        assert len(filtered.segments) >= 1
-        # Check segment content
-        segment_sqls = [s.sql for s in filtered.segments]
-        # At least one segment should mention status or deleted_at
-        has_filter = any("status" in sql or "deleted" in sql for sql in segment_sqls)
+        assert filtered.segments == []
+        assert len(filtered.invariant_filters) >= 1
+        has_filter = any("status" in sql or "deleted" in sql for sql in filtered.invariant_filters)
         assert has_filter
 
     def test_time_granularities(self):
@@ -164,6 +193,94 @@ class TestEdgeCases:
             dim = bool_patterns.get_dimension(dim_name)
             assert dim is not None, f"Dimension {dim_name} not found"
             assert dim.type == "boolean", f"{dim_name} should be boolean type"
+
+
+class TestExpressionTransforms:
+    """Test Malloy-to-SQL expression transformations via parsed fixtures."""
+
+    def setup_method(self):
+        adapter = MalloyAdapter()
+        self.graph = adapter.parse(Path("tests/fixtures/malloy/expression_transforms.malloy"))
+
+    def test_null_coalesce_simple(self):
+        """?? with two operands -> COALESCE(a, b)."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("safe_name")
+        assert dim is not None
+        assert "COALESCE" in dim.sql.upper()
+        assert "name" in dim.sql.lower()
+        assert "Unknown" in dim.sql
+
+    def test_null_coalesce_triple(self):
+        """?? with three operands -> COALESCE(a, b, c)."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("fallback_value")
+        assert dim is not None
+        sql = dim.sql.upper()
+        assert "COALESCE" in sql
+        # Should have all three values
+        assert "PRIMARY_VALUE" in sql
+        assert "SECONDARY_VALUE" in sql
+
+    def test_date_literal_full(self):
+        """@YYYY-MM-DD -> DATE 'YYYY-MM-DD'."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("cutoff_full")
+        assert dim is not None
+        assert "DATE" in dim.sql.upper()
+        assert "2024-01-15" in dim.sql
+
+    def test_date_literal_month(self):
+        """@YYYY-MM -> DATE 'YYYY-MM-01'."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("cutoff_month")
+        assert dim is not None
+        assert "DATE" in dim.sql.upper()
+        assert "2024-03-01" in dim.sql
+
+    def test_date_literal_year(self):
+        """@YYYY -> DATE 'YYYY-01-01'."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("cutoff_year")
+        assert dim is not None
+        assert "DATE" in dim.sql.upper()
+        assert "2024-01-01" in dim.sql
+
+    def test_and_tree_operators(self):
+        """field < X & > Y -> field < X AND field > Y."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("in_range")
+        assert dim is not None
+        assert "AND" in dim.sql.upper()
+        assert "2031" in dim.sql
+        assert "-8000" in dim.sql
+
+    def test_and_tree_values(self):
+        """status != 'A' & 'B' -> status != 'A' AND status != 'B'."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("not_excluded")
+        assert dim is not None
+        assert "AND" in dim.sql.upper()
+        assert "Cancelled" in dim.sql
+        assert "Returned" in dim.sql
+
+    def test_pick_when_to_case(self):
+        """pick/when/else -> CASE WHEN ... THEN ... ELSE ... END."""
+        transforms = self.graph.get_model("transforms")
+        dim = transforms.get_dimension("category")
+        assert dim is not None
+        sql = dim.sql.upper()
+        assert "CASE" in sql
+        assert "WHEN" in sql
+        assert "THEN" in sql
+        assert "END" in sql
+
+    def test_now_to_current_timestamp(self):
+        """Standalone now -> CURRENT_TIMESTAMP."""
+        time_check = self.graph.get_model("time_check")
+        dim = time_check.get_dimension("current_time")
+        assert dim is not None
+        assert dim.sql == "CURRENT_TIMESTAMP"
 
 
 def _is_passthrough_dimension(dim, primary_key: str) -> bool:

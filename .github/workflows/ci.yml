@@ -5,27 +5,70 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  # Non-PR runs get a unique suffix so queued main runs are retained too.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   python:
-    name: Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }} (${{ matrix.engine }} engine)
     runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+      SIDEMANTIC_ENGINE: ${{ matrix.engine }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        engine: [python]
+        include:
+          - python-version: "3.12"
+            engine: rust
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        id: uv
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install core dependencies
         run: uv sync --extra dev
+
+      - name: Check core import without DAX extra
+        run: |
+          uv run python - <<'PY'
+          import sys
+
+          from sidemantic import Dimension, Metric, Model
+
+          assert Model.__name__ == "Model"
+          assert Dimension.__name__ == "Dimension"
+          assert Metric.__name__ == "Metric"
+          assert "sidemantic_dax" not in sys.modules
+          PY
+
+      - name: Install DAX and MCP Apps test dependencies
+        run: uv sync --extra dev --extra dax --extra apps
+
+      - name: Install browser test runtime
+        run: uv run python -m playwright install --with-deps chromium
 
       - name: Check version consistency
         run: |
@@ -38,16 +81,242 @@ jobs:
           echo "Version check passed: $PYPROJECT_VERSION"
 
       - name: Run ruff check
-        run: uv run ruff check . --exclude docs/_extensions --exclude sidemantic-duckdb/extension-ci-tools --exclude sidemantic-duckdb/scripts --exclude sidemantic-duckdb/duckdb --exclude sidemantic/adapters/malloy_grammar
+        run: uv run ruff check . --exclude docs/_extensions --exclude sidemantic-duckdb/extension-ci-tools --exclude sidemantic-duckdb/scripts --exclude sidemantic-duckdb/duckdb --exclude sidemantic/adapters/malloy_grammar --exclude sidemantic/adapters/holistics_grammar
 
       - name: Run ruff format check
-        run: uv run ruff format --check . --exclude docs/_extensions --exclude sidemantic-duckdb/extension-ci-tools --exclude sidemantic-duckdb/scripts --exclude sidemantic-duckdb/duckdb --exclude sidemantic/adapters/malloy_grammar
+        run: uv run ruff format --check . --exclude docs/_extensions --exclude sidemantic-duckdb/extension-ci-tools --exclude sidemantic-duckdb/scripts --exclude sidemantic-duckdb/duckdb --exclude sidemantic/adapters/malloy_grammar --exclude sidemantic/adapters/holistics_grammar
 
-      - name: Run tests
-        run: uv run pytest -v --cov=sidemantic --cov-report=term-missing
+      - name: Check public API types
+        run: |
+          uv run mypy
+          uv run mypy --config-file tests/typing/mypy.ini tests/typing/package_consumer.py
 
-      - name: Update JSON Schema if needed
-        if: github.event_name == 'pull_request'
+      - name: Check typed package marker
+        run: |
+          uv build --wheel
+          unzip -l dist/*.whl | grep -q 'sidemantic/py.typed'
+
+      - name: Run Python reference suite
+        if: matrix.engine == 'python'
+        run: uv run --with adbc-driver-sqlite pytest -v --test-engine python --cov-fail-under=76 --junitxml=test-results.xml
+
+      - name: Run full shared suite against Rust
+        if: matrix.engine == 'rust'
+        run: uv run --with adbc-driver-sqlite pytest -v --test-engine rust --no-cov --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.python-version }}-${{ matrix.engine }}
+          path: test-results.xml
+
+      - name: Run installed-wheel DAX smoke
+        run: |
+          uv build sidemantic-rs --out-dir /tmp/sidemantic-dax-dist
+          uv build crates/dax-pyo3 --out-dir /tmp/sidemantic-dax-dist
+          uv build --out-dir /tmp/sidemantic-dist
+          SIDEMANTIC_WHEEL=$(realpath "$(find /tmp/sidemantic-dist -name 'sidemantic-[0-9]*.whl' -print -quit)")
+          cd /tmp
+          uv run --no-project --find-links /tmp/sidemantic-dax-dist --with "${SIDEMANTIC_WHEEL}[dax]" -- python - <<'PY'
+          import sidemantic_dax
+
+          sidemantic_dax.parse_expression("1")
+          PY
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
+
+  dependency-compatibility:
+    name: Dependencies (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: minimum direct
+            python-version: "3.11"
+            resolution: lowest-direct
+          - name: unlocked latest
+            python-version: "3.14"
+            resolution: highest
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Install uv
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Resolve ${{ matrix.name }} dependencies
+        run: >-
+          uv sync
+          --extra dev
+          --extra dax
+          --extra charts
+          --extra widget
+          --extra lsp
+          --extra workbench
+          --upgrade
+          --resolution ${{ matrix.resolution }}
+
+      - name: Exercise maintained Python surfaces
+        run: >-
+          uv run --no-sync pytest
+          tests/core
+          tests/lsp
+          tests/widget
+          tests/test_charts.py
+          tests/test_core_imports.py
+          tests/test_project.py
+          -q
+          -o addopts="-m 'not integration'"
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
+
+  base-install-cli:
+    name: Base Install CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Install uv
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build runtime distribution
+        run: uv build sidemantic-rs --out-dir /tmp/sidemantic-runtime-dist
+
+      - name: Smoke base CLI install
+        run: |
+          set -euo pipefail
+          tmpdir="$(mktemp -d)"
+          mkdir -p "$tmpdir/models"
+          cat > "$tmpdir/models/models.yml" <<'YAML'
+          models:
+            - name: orders
+              table: orders
+              primary_key: id
+              dimensions:
+                - name: status
+                  type: categorical
+              metrics:
+                - name: order_count
+                  agg: count
+          YAML
+
+          uv run --no-project --find-links /tmp/sidemantic-runtime-dist --with . sidemantic --version
+          uv run --no-project --find-links /tmp/sidemantic-runtime-dist --with . sidemantic validate "$tmpdir/models"
+          uv run --no-project --find-links /tmp/sidemantic-runtime-dist --with . sidemantic query "SELECT order_count, status FROM orders" --models "$tmpdir/models" --dry-run
+
+          uv run --no-project --find-links /tmp/sidemantic-runtime-dist --with . python - <<'PYTHON'
+          from sidemantic import SemanticLayer, Model, Metric
+          for engine in (None, "rust"):
+              layer = SemanticLayer(engine=engine)
+              layer.add_model(Model(name="orders", table="orders", metrics=[Metric(name="count", agg="count")]))
+              layer.compile(metrics=["orders.count"])
+              assert layer.last_engine_selection == {"engine": engine or "python", "reason": None}
+              layer.adapter.close()
+          PYTHON
+
+          set +e
+          timeout 10s uv run --no-project --find-links /tmp/sidemantic-runtime-dist --with . sidemantic serve "$tmpdir/models" >"$tmpdir/serve.out" 2>"$tmpdir/serve.err"
+          serve_status=$?
+          set -e
+          if [ "$serve_status" -eq 0 ]; then
+            echo "base install unexpectedly ran sidemantic serve without the serve extra"
+            exit 1
+          fi
+          if [ "$serve_status" -eq 124 ]; then
+            echo "base install unexpectedly started sidemantic serve without the serve extra"
+            cat "$tmpdir/serve.out"
+            cat "$tmpdir/serve.err" >&2
+            exit 1
+          fi
+          grep -q "sidemantic\\[api\\]" "$tmpdir/serve.err"
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
+
+  update-schema:
+    name: Update JSON Schema
+    needs: python
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Install uv
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra dax
+
+      - name: Generate and commit schema if needed
         run: |
           uv run python scripts/generate_schema.py
           if ! git diff --exit-code sidemantic-schema.json; then
@@ -55,8 +324,111 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add sidemantic-schema.json
             git commit -m "Auto-update JSON schema"
-            git push origin HEAD:${{ github.head_ref }}
+            git push
           fi
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
+
+  native-compat:
+    name: Native Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Install uv
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run Python native fixtures
+        run: uv run pytest tests/native_compat -v
+
+      - name: Install DuckDB ADBC driver
+        run: |
+          curl -L https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-linux-amd64.zip -o /tmp/libduckdb.zip
+          unzip -q /tmp/libduckdb.zip -d /tmp/libduckdb
+          echo "SIDEMANTIC_TEST_ADBC_DUCKDB_DRIVER=/tmp/libduckdb/libduckdb.so" >> "$GITHUB_ENV"
+
+      - name: Run Rust native fixtures
+        id: native_fixtures
+        working-directory: sidemantic-rs
+        run: |
+          cargo test --test native_fixtures
+          cargo test --features adbc-exec --test native_fixtures native_fixtures_execute_expected_results_with_duckdb_adbc
+
+      - name: Capture native fixture stack overflow
+        if: ${{ failure() && steps.native_fixtures.outcome == 'failure' }}
+        timeout-minutes: 5
+        working-directory: sidemantic-rs
+        run: |
+          set -euo pipefail
+          if ! command -v gdb >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y gdb
+          fi
+          fixture_target_dir="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)"
+          fixture_binary=""
+          for candidate in "$fixture_target_dir"/debug/deps/native_fixtures-*; do
+            if [[ -f "$candidate" && -x "$candidate" && ( -z "$fixture_binary" || "$candidate" -nt "$fixture_binary" ) ]]; then
+              fixture_binary="$candidate"
+            fi
+          done
+          if [[ -z "$fixture_binary" ]]; then
+            echo 'No compiled native_fixtures binary found' >&2
+            exit 1
+          fi
+          printf 'Debugging existing binary: %s\n' "$fixture_binary"
+          timeout 120s gdb --batch --quiet \
+            -ex 'set pagination off' \
+            -ex 'set confirm off' \
+            -ex 'set debuginfod enabled off' \
+            -ex 'set print frame-arguments none' \
+            -ex 'handle SIGSEGV stop print nopass' \
+            -ex 'handle SIGABRT stop print nopass' \
+            -ex run \
+            -ex 'thread apply all bt 80' \
+            -ex 'info frame' \
+            -ex 'x/12i $pc' \
+            --args "$fixture_binary" native_fixtures_load_and_compile --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/native-fixture-backtrace.txt"
+
+      - name: Upload native fixture backtrace
+        if: ${{ always() && steps.native_fixtures.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-fixture-backtrace-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-fixture-backtrace.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
 
   check-rust-changes:
     name: Check Rust/DuckDB changes
@@ -64,6 +436,9 @@ jobs:
     outputs:
       rust_changed: ${{ steps.changes.outputs.rust }}
       duckdb_changed: ${{ steps.changes.outputs.duckdb }}
+      dax_changed: ${{ steps.changes.outputs.dax }}
+      webapp_changed: ${{ steps.changes.outputs.webapp }}
+      widget_changed: ${{ steps.changes.outputs.widget }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -72,15 +447,141 @@ jobs:
           filters: |
             rust:
               - 'sidemantic-rs/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
+              # The installed-extension conformance job exercises Python callers,
+              # not just the crate. Keep its contract and fixture inputs gated.
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'sidemantic/__init__.py'
+              - 'sidemantic/rust_bridge.py'
+              - 'sidemantic/rust_parity.py'
+              - 'sidemantic/semantic_handoff.py'
+              - 'sidemantic/core/**'
+              - 'sidemantic/sql/**'
+              - 'sidemantic/db/__init__.py'
+              - 'sidemantic/db/base.py'
+              - 'sidemantic/db/duckdb.py'
+              - 'sidemantic/db/postgres.py'
+              - 'sidemantic/db/unavailable.py'
+              - 'sidemantic/validation.py'
+              - 'sidemantic/validation_runner.py'
+              - 'sidemantic/cli.py'
+              - 'sidemantic/cli_contract.py'
+              - 'sidemantic/cli_polish.py'
+              - 'sidemantic/config.py'
+              - 'sidemantic/loaders.py'
+              - 'sidemantic/project.py'
+              - 'sidemantic/paths.py'
+              - 'sidemantic/formats.py'
+              - 'sidemantic/fidelity.py'
+              - 'sidemantic/yaml_compat.py'
+              # Imported native/Cube/Ossie fixtures are acceptance inputs too.
+              - 'sidemantic/adapters/__init__.py'
+              - 'sidemantic/adapters/base.py'
+              - 'sidemantic/adapters/sidemantic.py'
+              - 'sidemantic/adapters/cube.py'
+              - 'sidemantic/adapters/ossie.py'
+              - 'sidemantic/interchange/ossie/**'
+              - 'tests/conftest.py'
+              - 'tests/semantic_conformance/**/*.py'
+              - 'tests/semantic_conformance/fixtures/**'
             duckdb:
               - 'sidemantic-duckdb/**'
               - 'sidemantic-rs/**'
+              # The extension links the workspace crate; host tests and their
+              # shared SemanticInput fixture live under the two trees above.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            dax:
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/dax/fixtures/**'
+            webapp:
+              - 'webapp/**'
+              - 'scripts/build_webapp.py'
+              - 'scripts/build_ui_distribution.py'
+              - 'sidemantic/ui/static/**'
+              - 'sidemantic-rs/ui/**'
+              - 'plugins/sidemantic/skills/webapp-builder/assets/ui-dist/**'
+              - 'examples/sidemantic_wasm_demo/src/components/sidemantic/**'
+            widget:
+              - 'js/**'
+              - 'scripts/build_widget.py'
+              - 'sidemantic/widget/static/**'
+              - 'plugins/sidemantic/skills/webapp-builder/assets/ui-dist/**'
+
+  dax-rust:
+    name: Rust (DAX crates)
+    needs: check-rust-changes
+    if: needs.check-rust-changes.outputs.dax_changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Run cargo fmt check
+        run: cargo fmt --check
+
+      - name: Run cargo clippy
+        run: cargo clippy -p dax-parser -p dax-pyo3 --all-targets -- -D warnings
+
+      - name: Run cargo test
+        run: cargo test -p dax-parser -p dax-pyo3
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
 
   rust:
     name: Rust (sidemantic-rs)
     needs: check-rust-changes
     if: needs.check-rust-changes.outputs.rust_changed == 'true'
     runs-on: ubuntu-latest
+    # This job builds many feature/host combinations. Full debug symbols make
+    # the completed-build cache too large to duplicate into its export tar.
+    # Keep debug assertions and unoptimized tests, but omit symbol data.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sidemantic
+          POSTGRES_PASSWORD: sidemantic
+          POSTGRES_DB: sidemantic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sidemantic"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: sidemantic-rs
@@ -90,55 +591,178 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sidemantic-rs
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}-no-debuginfo
+
+      - name: Install uv
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
 
       - name: Run cargo fmt check
         run: cargo fmt --check
 
       - name: Run cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run cargo test
         run: cargo test
+        env:
+          RUST_MIN_STACK: 16777216
+
+      - name: Check package metadata
+        run: cargo test --test package_metadata
+
+      - name: Check crate package dry run
+        run: cargo package --locked --no-verify
+
+      - name: Check standalone feature surfaces
+        run: |
+          cargo check --no-default-features --all-targets
+          cargo check --features python --lib
+          cargo check --features python-adbc --lib
+          cargo check --features mcp-server --bin sidemantic-mcp --test mcp_protocol
+          cargo check --features mcp-adbc --bin sidemantic-mcp
+          cargo check --features runtime-server --bin sidemantic-server --test http_server
+          cargo check --features runtime-server-adbc --bin sidemantic-server
+          cargo check --features runtime-lsp --bin sidemantic-lsp --test lsp_protocol_smoke
+          cargo check --features workbench-tui --bin sidemantic --bin sidemantic-workbench
+          cargo check --features workbench-adbc --bin sidemantic --bin sidemantic-workbench
+
+      - name: Install DuckDB ADBC driver
+        run: |
+          curl -L https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-linux-amd64.zip -o /tmp/libduckdb.zip
+          unzip -q /tmp/libduckdb.zip -d /tmp/libduckdb
+          echo "SIDEMANTIC_TEST_ADBC_DUCKDB_DRIVER=/tmp/libduckdb/libduckdb.so" >> "$GITHUB_ENV"
+
+      - name: Install SQLite ADBC driver
+        run: |
+          uv run --no-project --with adbc-driver-sqlite python - <<'PY' >> "$GITHUB_ENV"
+          import adbc_driver_sqlite
+
+          print(f"SIDEMANTIC_TEST_ADBC_SQLITE_DRIVER={adbc_driver_sqlite._driver_path()}")
+          print("SIDEMANTIC_TEST_ADBC_SQLITE_URI=:memory:")
+          print("SIDEMANTIC_TEST_ADBC_REQUIRE=duckdb,sqlite")
+          PY
+
+      - name: Run standalone protocol and UI tests
+        run: |
+          cargo test --features mcp-server --test mcp_protocol
+          cargo test --features runtime-server --test http_server
+          cargo test --features runtime-lsp --test lsp_protocol_smoke
+          cargo test --features workbench-tui --test cli_smoke workbench
+          cargo test --features workbench-adbc --test cli_smoke workbench
+          cargo test --features workbench-tui --test workbench_pty_smoke
+          cargo test --features workbench-adbc --test workbench_pty_smoke
+          cargo test --features workbench-adbc --bin sidemantic
+          cargo test --features adbc-exec --test adbc_driver_matrix
+          cargo test --features mcp-adbc,runtime-server-adbc --test adbc_duckdb_e2e
+
+      - name: Smoke C ABI header and static library
+        run: |
+          cargo build --release --lib
+          SIDEMANTIC_STATICLIB="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')/release/libsidemantic.a"
+          cc -std=c11 -Wall -Wextra -I include tests/c_abi_smoke.c "$SIDEMANTIC_STATICLIB" -lpthread -ldl -lm -lrt -o /tmp/sidemantic_c_abi_smoke
+          /tmp/sidemantic_c_abi_smoke
+
+      - name: Build WASM host module
+        run: cargo build --no-default-features --features wasm --target wasm32-unknown-unknown --lib
+
+      - name: Install wasm-bindgen test runner
+        run: |
+          WASM_BINDGEN_VERSION="$(cargo metadata --format-version 1 | python3 -c 'import json, sys; print(next(pkg["version"] for pkg in json.load(sys.stdin)["packages"] if pkg["name"] == "wasm-bindgen"))')"
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
+
+      - name: Run WASM runtime tests
+        run: CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --target wasm32-unknown-unknown --features wasm --test wasm_bindgen_runtime
+
+      - name: Execute SemanticInput through the public WASM module
+        run: |
+          wasm-bindgen ../target/wasm32-unknown-unknown/debug/sidemantic.wasm --target nodejs --out-dir ../target/semantic-host
+          SIDEMANTIC_WASM_MODULE="$PWD/../target/semantic-host/sidemantic.js" uv run --no-project tests/test_wasm_semantic_host.py
+
+      - name: Check Python extension build
+        run: uvx maturin build --out dist
+
+      - name: Smoke Python extension wheel
+        run: uv run --no-project --with dist/*.whl tests/python_wheel_smoke.py
+
+      - name: Check lightweight Python extension build
+        env:
+          MBX_VERIFY: "1"
+        run: uvx maturin build --no-default-features --features python --out dist-python
+
+      - name: Smoke lightweight Python extension wheel
+        run: uv run --no-project --with dist-python/*.whl tests/python_wheel_python_smoke.py
+
+      - name: Run semantic compiler conformance with the built extension
+        working-directory: .
+        env:
+          SIDEMANTIC_TEST_POSTGRES_DSN: postgresql://sidemantic:sidemantic@localhost:5432/sidemantic
+        run: |
+          uv run --extra dev --with "psycopg[binary]" --with ./sidemantic-rs/dist-python/*.whl python - <<'PY'
+          import pytest
+          import sidemantic_rs
+
+          assert callable(sidemantic_rs.compile_with_semantic_input)
+          assert callable(sidemantic_rs.validate_with_semantic_input)
+          assert callable(sidemantic_rs.rewrite_with_semantic_input)
+          raise SystemExit(pytest.main(["--no-cov", "-q", "tests/semantic_conformance"]))
+          PY
+
+      - name: Check Python extension ADBC build
+        run: uvx maturin build --no-default-features --features python-adbc --out dist-adbc
+
+      - name: Smoke Python extension ADBC wheel
+        run: uv run --no-project --with dist-adbc/*.whl tests/python_wheel_adbc_smoke.py
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
 
   duckdb-extension:
-    name: DuckDB Extension
+    name: DuckDB Extension (${{ matrix.duckdb }})
     needs: check-rust-changes
     if: needs.check-rust-changes.outputs.duckdb_changed == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        duckdb: [v1.5.6, v2.0-cyanoptera]
     env:
       GEN: ninja
+      DUCKDB_VERSION: ${{ matrix.duckdb }}
+      SIDEMANTIC_NATIVE_PEG: ${{ matrix.duckdb == 'v2.0-cyanoptera' && '1' || '' }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone DuckDB dependencies
-        working-directory: sidemantic-duckdb
-        run: |
-          # These are listed as submodules in .gitmodules but aren't tracked properly
-          # Clone them directly at the commits the extension was built against
-          rm -rf duckdb extension-ci-tools
-          git clone --depth 1 --branch v1.4.2 https://github.com/duckdb/duckdb.git duckdb
-          git clone --depth 1 --branch v1.4.2 https://github.com/duckdb/extension-ci-tools.git extension-ci-tools
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
         with:
-          workspaces: sidemantic-rs
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Fetch DuckDB dependencies
+        working-directory: sidemantic-duckdb
+        run: make deps
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build
-
-      - name: Build Rust library
-        working-directory: sidemantic-rs
-        run: cargo build --release
 
       - name: Build DuckDB extension
         working-directory: sidemantic-duckdb
@@ -147,3 +771,75 @@ jobs:
       - name: Run extension tests
         working-directory: sidemantic-duckdb
         run: make test
+
+      - name: Install uv for SQL host acceptance
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Execute SemanticInput in the loaded DuckDB extension
+        env:
+          SIDEMANTIC_DUCKDB_BINARY: sidemantic-duckdb/build/release/duckdb
+          SIDEMANTIC_DUCKDB_EXTENSION: sidemantic-duckdb/build/release/extension/sidemantic/sidemantic.duckdb_extension
+        run: |
+          uv run sidemantic-duckdb/test/test_semantic_input_host.py
+          uv run sidemantic-duckdb/test/test_catalog_host.py
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
+
+  webapp:
+    name: Webapp (types + unit)
+    needs: check-rust-changes
+    if: needs.check-rust-changes.outputs.webapp_changed == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun test src
+
+      - name: Check committed bundles
+        run: |
+          python ../scripts/build_webapp.py --check
+          python ../scripts/build_ui_distribution.py --check
+
+  widget:
+    name: AnyWidget bundle
+    needs: check-rust-changes
+    if: needs.check-rust-changes.outputs.widget_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        working-directory: js
+        run: bun install --frozen-lockfile
+
+      - name: Check committed bundle
+        run: python scripts/build_widget.py --check

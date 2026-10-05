@@ -1,648 +1,207 @@
 //! Query rewriter: rewrites SQL using semantic layer definitions
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, Join, JoinConstraint, JoinOperator,
-    ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins,
+use crate::semantic_input::dialects::parse_many as polyglot_parse;
+use polyglot_sql::{
+    expressions::{Identifier, Join, JoinKind, Select, TableRef, With},
+    generate as polyglot_generate, DialectType, Expression,
 };
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
-use crate::core::{MetricType, SemanticGraph};
+use crate::core::SemanticGraph;
 use crate::error::{Result, SidemanticError};
+use crate::sql::SemanticQuery;
+
+type QueryPreparer<'a> = &'a dyn Fn(&SemanticGraph, &mut SemanticQuery) -> Result<()>;
+
+mod binding;
+#[cfg(not(target_arch = "wasm32"))]
+mod parser_worker;
+mod policy;
+mod yardstick;
 
 /// SQL query rewriter using semantic definitions
 pub struct QueryRewriter<'a> {
     graph: &'a SemanticGraph,
+    query_preparer: Option<QueryPreparer<'a>>,
+    policy_definitions: &'a str,
+    rename_only: bool,
+    security_controls: bool,
+    warnings: std::cell::RefCell<Vec<String>>,
+    used_preaggregation: std::cell::Cell<bool>,
 }
 
 impl<'a> QueryRewriter<'a> {
     pub fn new(graph: &'a SemanticGraph) -> Self {
-        Self { graph }
+        Self {
+            graph,
+            query_preparer: None,
+            policy_definitions: "",
+            rename_only: false,
+            security_controls: false,
+            warnings: std::cell::RefCell::new(Vec::new()),
+            used_preaggregation: std::cell::Cell::new(false),
+        }
+    }
+
+    pub(crate) fn take_warnings(&self) -> Vec<String> {
+        self.warnings.take()
+    }
+
+    /// Apply request policies to each semantic leaf before retaining its
+    /// relational wrappers. Synthetic aggregate inputs remain visible to policy validation.
+    pub(crate) fn with_query_preparer(
+        mut self,
+        prepare: QueryPreparer<'a>,
+        policy_definitions: &'a str,
+        security_controls: bool,
+    ) -> Self {
+        self.query_preparer = Some(prepare);
+        self.policy_definitions = policy_definitions;
+        self.security_controls = security_controls;
+        self
     }
 
     /// Rewrite a SQL query using semantic layer definitions
     pub fn rewrite(&self, sql: &str) -> Result<String> {
-        let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
-            .map_err(|e| SidemanticError::SqlParse(e.to_string()))?;
+        self.rewrite_with_dialect(sql, DialectType::Generic)
+    }
+
+    pub fn rewrite_with_dialect(&self, sql: &str, dialect: DialectType) -> Result<String> {
+        self.rewrite_with_output_dialect(sql, dialect, dialect)
+    }
+
+    pub(crate) fn rewrite_with_output_dialect(
+        &self,
+        sql: &str,
+        input_dialect: DialectType,
+        output_dialect: DialectType,
+    ) -> Result<String> {
+        self.used_preaggregation.set(false);
+        if let Some(rewritten) = self.rewrite_yardstick(sql, input_dialect, output_dialect)? {
+            return Ok(rewritten);
+        }
+        // Yardstick must remove its extension syntax before the ordinary SQL
+        // normalizer runs. Semantic binding and graph SQL share DuckDB syntax.
+        let statements = parse_rewrite_input(sql, input_dialect)?;
 
         if statements.is_empty() {
             return Err(SidemanticError::SqlParse("Empty SQL".into()));
         }
+        if self.query_preparer.is_some() && statements.len() != 1 {
+            return Err(policy::unsupported());
+        }
 
         let mut rewritten_statements = Vec::new();
-
         for statement in statements {
             let rewritten = self.rewrite_statement(statement)?;
-            rewritten_statements.push(rewritten.to_string());
+            rewritten_statements.push(crate::semantic_input::dialects::emit(
+                rewritten,
+                DialectType::DuckDB,
+                output_dialect,
+            )?);
         }
 
-        Ok(rewritten_statements.join(";\n"))
+        let mut sql = rewritten_statements.join(";\n");
+        // Parsing semantic leaves into relational wrappers drops their trailing
+        // comments. Preserve routing independently so missing-rollup fallback
+        // and strict mode observe the compiler's actual selection.
+        if self.used_preaggregation.get() {
+            sql.push_str("\n-- used_preagg=true");
+        }
+        Ok(sql)
     }
 
-    fn rewrite_statement(&self, statement: Statement) -> Result<Statement> {
-        match statement {
-            Statement::Query(query) => {
-                let rewritten_query = self.rewrite_query(*query)?;
-                Ok(Statement::Query(Box::new(rewritten_query)))
-            }
-            _ => Ok(statement),
-        }
+    fn rewrite_statement(&self, statement: Expression) -> Result<Expression> {
+        self.rewrite_policy_statement(statement)
+    }
+}
+
+pub(super) fn parse_sql_with_large_stack(sql: &str) -> Result<Vec<Expression>> {
+    parse_sql_with_dialect(sql, DialectType::Generic)
+}
+
+fn parse_sql_with_dialect(sql: &str, dialect: DialectType) -> Result<Vec<Expression>> {
+    let sql = sql.to_owned();
+    run_parser(move || {
+        #[cfg(target_arch = "wasm32")]
+        crate::wasm_sql_guard::check(&sql, dialect)?;
+        polyglot_parse(&sql, dialect)
+    })
+}
+
+fn parse_rewrite_input(sql: &str, input_dialect: DialectType) -> Result<Vec<Expression>> {
+    let sql = sql.to_owned();
+    run_parser(move || {
+        // Transpilation invokes the same recursive parser as the final parse.
+        // Keep both stages on the established parser worker; running source
+        // normalization on the caller bypassed its stack protection.
+        let sql = crate::semantic_input::dialects::query_batch(&sql, input_dialect)?;
+        #[cfg(target_arch = "wasm32")]
+        crate::wasm_sql_guard::check(&sql, DialectType::DuckDB)?;
+        polyglot_parse(&sql, DialectType::DuckDB)
+    })
+}
+
+fn run_parser(
+    parse: impl FnOnce() -> Result<Vec<Expression>> + Send + 'static,
+) -> Result<Vec<Expression>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        parse()
     }
 
-    fn rewrite_query(&self, query: Query) -> Result<Query> {
-        let body = match *query.body {
-            SetExpr::Select(select) => {
-                let rewritten_select = self.rewrite_select(*select)?;
-                SetExpr::Select(Box::new(rewritten_select))
-            }
-            other => other,
-        };
-
-        Ok(Query {
-            body: Box::new(body),
-            ..query
-        })
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        parser_worker::run(parse)
     }
+}
 
-    fn rewrite_select(&self, select: Select) -> Result<Select> {
-        // Find semantic model references in FROM clause
-        let mut model_refs = self.find_model_references(&select.from);
+fn resolve_model_ref<'a>(
+    table_or_alias: &str,
+    model_refs: &'a [(String, String)],
+) -> Option<(&'a str, &'a str)> {
+    model_refs
+        .iter()
+        .find(|(model, alias)| model == table_or_alias || alias == table_or_alias)
+        .map(|(model, alias)| (model.as_str(), alias.as_str()))
+}
 
-        if model_refs.is_empty() {
-            // No semantic models, return as-is
-            return Ok(select);
-        }
+fn split_granularity(field: &str) -> (&str, Option<&str>) {
+    const VALID_GRANULARITIES: [&str; 8] = [
+        "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+    ];
 
-        // Find all models referenced in projection AND WHERE clause
-        let mut referenced_models = self.find_referenced_models(&select.projection);
-        if let Some(ref selection) = select.selection {
-            self.collect_model_refs_from_expr(selection, &mut referenced_models);
-        }
-
-        // Find models that need to be joined (referenced but not in FROM)
-        let base_model = model_refs.first().map(|(m, _)| m.clone());
-        let models_in_from: HashSet<_> = model_refs.iter().map(|(m, _)| m.clone()).collect();
-        let models_to_join: Vec<_> = referenced_models
-            .iter()
-            .filter(|m| !models_in_from.contains(*m))
-            .cloned()
-            .collect();
-
-        // Add aliases for joined models
-        for model_name in &models_to_join {
-            let alias = model_name.chars().next().unwrap_or('t').to_string();
-            model_refs.push((model_name.clone(), alias));
-        }
-
-        // Rewrite SELECT items
-        let projection = self.rewrite_projection(&select.projection, &model_refs)?;
-
-        // Rewrite FROM clause with JOINs
-        let from = self.rewrite_from_with_joins(
-            &select.from,
-            &model_refs,
-            base_model.as_deref(),
-            &models_to_join,
-        )?;
-
-        // Rewrite WHERE clause
-        let selection = select
-            .selection
-            .map(|expr| self.rewrite_expr(expr, &model_refs))
-            .transpose()?;
-
-        // Add GROUP BY if we have aggregations and dimensions
-        let has_aggregations = self.has_aggregations(&projection);
-        let has_dimensions = self.has_non_aggregated_columns(&projection);
-
-        let group_by = if has_aggregations && has_dimensions {
-            self.build_group_by(&projection)
-        } else {
-            select.group_by
-        };
-
-        Ok(Select {
-            projection,
-            from,
-            selection,
-            group_by,
-            ..select
-        })
-    }
-
-    /// Find semantic model references in FROM clause
-    fn find_model_references(&self, from: &[TableWithJoins]) -> Vec<(String, String)> {
-        let mut refs = Vec::new();
-
-        for table in from {
-            if let TableFactor::Table { name, alias, .. } = &table.relation {
-                let table_name = name.0.first().map(|i| i.value.clone()).unwrap_or_default();
-
-                if self.graph.get_model(&table_name).is_some() {
-                    let alias_name = alias
-                        .as_ref()
-                        .map(|a| a.name.value.clone())
-                        .unwrap_or_else(|| table_name.clone());
-                    refs.push((table_name, alias_name));
-                }
-            }
-        }
-
-        refs
-    }
-
-    /// Find all models referenced in the SELECT projection
-    fn find_referenced_models(&self, projection: &[SelectItem]) -> HashSet<String> {
-        let mut models = HashSet::new();
-
-        for item in projection {
-            match item {
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    self.collect_model_refs_from_expr(expr, &mut models);
-                }
-                _ => {}
-            }
-        }
-
-        models
-    }
-
-    /// Recursively collect model references from an expression
-    fn collect_model_refs_from_expr(&self, expr: &Expr, models: &mut HashSet<String>) {
-        match expr {
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                let model_name = &parts[0].value;
-                if self.graph.get_model(model_name).is_some() {
-                    models.insert(model_name.clone());
-                }
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                self.collect_model_refs_from_expr(left, models);
-                self.collect_model_refs_from_expr(right, models);
-            }
-            Expr::UnaryOp { expr, .. } => {
-                self.collect_model_refs_from_expr(expr, models);
-            }
-            Expr::Nested(inner) => {
-                self.collect_model_refs_from_expr(inner, models);
-            }
-            Expr::Function(f) => {
-                if let sqlparser::ast::FunctionArguments::List(args) = &f.args {
-                    for arg in &args.args {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            self.collect_model_refs_from_expr(e, models);
-                        }
-                    }
-                }
-            }
-            _ => {}
+    if let Some((base, gran)) = field.rsplit_once("__") {
+        if VALID_GRANULARITIES.contains(&gran) {
+            return (base, Some(gran));
         }
     }
 
-    /// Rewrite SELECT projection items
-    fn rewrite_projection(
-        &self,
-        projection: &[SelectItem],
-        model_refs: &[(String, String)],
-    ) -> Result<Vec<SelectItem>> {
-        let mut result = Vec::new();
+    (field, None)
+}
 
-        for item in projection {
-            match item {
-                SelectItem::UnnamedExpr(expr) => {
-                    let rewritten = self.rewrite_select_expr(expr.clone(), model_refs)?;
-                    result.push(SelectItem::UnnamedExpr(rewritten));
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    let rewritten = self.rewrite_select_expr(expr.clone(), model_refs)?;
-                    result.push(SelectItem::ExprWithAlias {
-                        expr: rewritten,
-                        alias: alias.clone(),
-                    });
-                }
-                other => result.push(other.clone()),
-            }
-        }
+fn has_star_projection(projection: &[Expression]) -> bool {
+    projection
+        .iter()
+        .any(|expr| matches!(expr, Expression::Star(_)))
+}
 
-        Ok(result)
-    }
-
-    /// Rewrite a SELECT expression (could be metric or dimension)
-    fn rewrite_select_expr(&self, expr: Expr, model_refs: &[(String, String)]) -> Result<Expr> {
-        match &expr {
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                let model_name = &parts[0].value;
-                let field_name = &parts[1].value;
-
-                // Find the model
-                if let Some((actual_model, alias)) = model_refs
-                    .iter()
-                    .find(|(m, a)| m == model_name || a == model_name)
-                {
-                    let model = self.graph.get_model(actual_model).unwrap();
-
-                    // Check if it's a metric
-                    if let Some(metric) = model.get_metric(field_name) {
-                        return Ok(self.metric_to_expr(metric, alias));
-                    }
-
-                    // Check if it's a dimension
-                    if let Some(dimension) = model.get_dimension(field_name) {
-                        return Ok(Expr::CompoundIdentifier(vec![
-                            Ident::new(alias.clone()),
-                            Ident::new(dimension.sql_expr().to_string()),
-                        ]));
-                    }
-                }
-
-                // Not a semantic reference, return as-is
-                Ok(expr)
-            }
-            _ => self.rewrite_expr(expr, model_refs),
-        }
-    }
-
-    /// Convert a metric to an expression
-    fn metric_to_expr(&self, metric: &crate::core::Metric, alias: &str) -> Expr {
-        match metric.r#type {
-            MetricType::Simple => {
-                // Handle Expression type: sql field contains the full expression
-                if let Some(crate::core::Aggregation::Expression) = &metric.agg {
-                    let dialect = GenericDialect {};
-                    let sql = format!("SELECT {}", metric.sql_expr());
-                    if let Ok(statements) = Parser::parse_sql(&dialect, &sql) {
-                        if let Some(Statement::Query(query)) = statements.into_iter().next() {
-                            if let SetExpr::Select(select) = *query.body {
-                                if let Some(SelectItem::UnnamedExpr(expr)) =
-                                    select.projection.into_iter().next()
-                                {
-                                    return expr;
-                                }
-                            }
-                        }
-                    }
-                    // Fallback: return as identifier
-                    return Expr::Identifier(Ident::new(metric.name.clone()));
-                }
-
-                let agg = metric.agg.as_ref().unwrap();
-                // COUNT without explicit sql defaults to COUNT(*)
-                let use_wildcard = metric.sql.as_deref() == Some("*")
-                    || (*agg == crate::core::Aggregation::Count && metric.sql.is_none());
-
-                let arg = if use_wildcard {
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                } else {
-                    let sql_expr = metric.sql_expr();
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(vec![
-                        Ident::new(alias.to_string()),
-                        Ident::new(sql_expr.to_string()),
-                    ])))
-                };
-
-                let func_name = match agg {
-                    crate::core::Aggregation::CountDistinct => "COUNT",
-                    _ => agg.as_sql(),
-                };
-
-                Expr::Function(sqlparser::ast::Function {
-                    name: ObjectName(vec![Ident::new(func_name.to_string())]),
-                    args: sqlparser::ast::FunctionArguments::List(
-                        sqlparser::ast::FunctionArgumentList {
-                            args: vec![arg],
-                            duplicate_treatment: if matches!(
-                                agg,
-                                crate::core::Aggregation::CountDistinct
-                            ) {
-                                Some(sqlparser::ast::DuplicateTreatment::Distinct)
-                            } else {
-                                None
-                            },
-                            clauses: vec![],
-                        },
-                    ),
-                    over: None,
-                    filter: None,
-                    null_treatment: None,
-                    within_group: vec![],
-                    parameters: sqlparser::ast::FunctionArguments::None,
-                })
-            }
-            MetricType::Derived | MetricType::Ratio => {
-                // For derived/ratio metrics, parse the SQL expression
-                // This is simplified; a full implementation would parse and rewrite
-                let dialect = GenericDialect {};
-                let sql = format!("SELECT {}", metric.sql_expr());
-                if let Ok(statements) = Parser::parse_sql(&dialect, &sql) {
-                    if let Some(Statement::Query(query)) = statements.into_iter().next() {
-                        if let SetExpr::Select(select) = *query.body {
-                            if let Some(SelectItem::UnnamedExpr(expr)) =
-                                select.projection.into_iter().next()
-                            {
-                                return expr;
-                            }
-                        }
-                    }
-                }
-                // Fallback: return as identifier
-                Expr::Identifier(Ident::new(metric.name.clone()))
-            }
-            MetricType::Cumulative | MetricType::TimeComparison => {
-                // Complex metric types require special handling with window functions
-                // For now, fall back to the metric's to_sql() output parsed as an expression
-                let dialect = GenericDialect {};
-                let sql = format!("SELECT {}", metric.to_sql(Some(alias)));
-                if let Ok(statements) = Parser::parse_sql(&dialect, &sql) {
-                    if let Some(Statement::Query(query)) = statements.into_iter().next() {
-                        if let SetExpr::Select(select) = *query.body {
-                            if let Some(SelectItem::UnnamedExpr(expr)) =
-                                select.projection.into_iter().next()
-                            {
-                                return expr;
-                            }
-                        }
-                    }
-                }
-                // Fallback: return as identifier
-                Expr::Identifier(Ident::new(metric.name.clone()))
-            }
-        }
-    }
-
-    /// Rewrite FROM clause with JOINs for cross-model references
-    fn rewrite_from_with_joins(
-        &self,
-        from: &[TableWithJoins],
-        model_refs: &[(String, String)],
-        base_model: Option<&str>,
-        models_to_join: &[String],
-    ) -> Result<Vec<TableWithJoins>> {
-        let mut result = Vec::new();
-
-        for table in from {
-            if let TableFactor::Table { name, alias, .. } = &table.relation {
-                let table_name = name.0.first().map(|i| i.value.clone()).unwrap_or_default();
-
-                if let Some(model) = self.graph.get_model(&table_name) {
-                    // Build JOINs for models referenced but not in FROM
-                    let mut joins = table.joins.clone();
-
-                    if Some(table_name.as_str()) == base_model {
-                        for target_model_name in models_to_join {
-                            if let Ok(join_path) =
-                                self.graph.find_join_path(&table_name, target_model_name)
-                            {
-                                for step in &join_path.steps {
-                                    let target_model =
-                                        self.graph.get_model(&step.to_model).unwrap();
-
-                                    // Find the alias for this model
-                                    let to_alias = model_refs
-                                        .iter()
-                                        .find(|(m, _)| m == &step.to_model)
-                                        .map(|(_, a)| a.clone())
-                                        .unwrap_or_else(|| step.to_model.clone());
-
-                                    let from_alias = model_refs
-                                        .iter()
-                                        .find(|(m, _)| m == &step.from_model)
-                                        .map(|(_, a)| a.clone())
-                                        .unwrap_or_else(|| step.from_model.clone());
-
-                                    // Build JOIN condition
-                                    let join_condition = if let Some(custom) =
-                                        &step.custom_condition
-                                    {
-                                        // Parse custom condition
-                                        let condition_sql = custom
-                                            .replace("{from}", &from_alias)
-                                            .replace("{to}", &to_alias);
-                                        let dialect = GenericDialect {};
-                                        let expr_sql = format!("SELECT 1 WHERE {condition_sql}");
-                                        if let Ok(stmts) = Parser::parse_sql(&dialect, &expr_sql) {
-                                            if let Some(Statement::Query(q)) =
-                                                stmts.into_iter().next()
-                                            {
-                                                if let SetExpr::Select(s) = *q.body {
-                                                    s.selection.unwrap_or_else(|| {
-                                                        self.build_default_join_condition(
-                                                            &from_alias,
-                                                            &step.from_key,
-                                                            &to_alias,
-                                                            &step.to_key,
-                                                        )
-                                                    })
-                                                } else {
-                                                    self.build_default_join_condition(
-                                                        &from_alias,
-                                                        &step.from_key,
-                                                        &to_alias,
-                                                        &step.to_key,
-                                                    )
-                                                }
-                                            } else {
-                                                self.build_default_join_condition(
-                                                    &from_alias,
-                                                    &step.from_key,
-                                                    &to_alias,
-                                                    &step.to_key,
-                                                )
-                                            }
-                                        } else {
-                                            self.build_default_join_condition(
-                                                &from_alias,
-                                                &step.from_key,
-                                                &to_alias,
-                                                &step.to_key,
-                                            )
-                                        }
-                                    } else {
-                                        self.build_default_join_condition(
-                                            &from_alias,
-                                            &step.from_key,
-                                            &to_alias,
-                                            &step.to_key,
-                                        )
-                                    };
-
-                                    joins.push(Join {
-                                        relation: TableFactor::Table {
-                                            name: ObjectName(vec![Ident::new(
-                                                target_model.table_name().to_string(),
-                                            )]),
-                                            alias: Some(TableAlias {
-                                                name: Ident::new(to_alias),
-                                                columns: vec![],
-                                            }),
-                                            args: None,
-                                            with_hints: vec![],
-                                            version: None,
-                                            partitions: vec![],
-                                            with_ordinality: false,
-                                        },
-                                        join_operator: JoinOperator::LeftOuter(JoinConstraint::On(
-                                            join_condition,
-                                        )),
-                                        global: false,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    let new_table = TableWithJoins {
-                        relation: TableFactor::Table {
-                            name: ObjectName(vec![Ident::new(model.table_name().to_string())]),
-                            alias: alias.clone(),
-                            args: None,
-                            with_hints: vec![],
-                            version: None,
-                            partitions: vec![],
-                            with_ordinality: false,
-                        },
-                        joins,
-                    };
-                    result.push(new_table);
-                } else {
-                    result.push(table.clone());
-                }
+fn table_name_and_alias(source: &Expression) -> Option<(String, Option<String>)> {
+    match source {
+        Expression::Table(table) => Some((
+            table.name.name.clone(),
+            table.alias.as_ref().map(|a| a.name.clone()),
+        )),
+        Expression::Alias(alias) => {
+            if let Expression::Table(table) = &alias.this {
+                Some((table.name.name.clone(), Some(alias.alias.name.clone())))
             } else {
-                result.push(table.clone());
+                None
             }
         }
-
-        Ok(result)
-    }
-
-    /// Build default JOIN condition (from.fk = to.pk)
-    fn build_default_join_condition(
-        &self,
-        from_alias: &str,
-        from_key: &str,
-        to_alias: &str,
-        to_key: &str,
-    ) -> Expr {
-        Expr::BinaryOp {
-            left: Box::new(Expr::CompoundIdentifier(vec![
-                Ident::new(from_alias.to_string()),
-                Ident::new(from_key.to_string()),
-            ])),
-            op: sqlparser::ast::BinaryOperator::Eq,
-            right: Box::new(Expr::CompoundIdentifier(vec![
-                Ident::new(to_alias.to_string()),
-                Ident::new(to_key.to_string()),
-            ])),
-        }
-    }
-
-    /// Rewrite general expressions
-    fn rewrite_expr(&self, expr: Expr, model_refs: &[(String, String)]) -> Result<Expr> {
-        match expr {
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                let model_name = &parts[0].value;
-                let field_name = &parts[1].value;
-
-                // Find the model and rewrite field reference
-                if let Some((actual_model, alias)) = model_refs
-                    .iter()
-                    .find(|(m, a)| m == model_name || a == model_name)
-                {
-                    let model = self.graph.get_model(actual_model).unwrap();
-
-                    if let Some(dimension) = model.get_dimension(field_name) {
-                        return Ok(Expr::CompoundIdentifier(vec![
-                            Ident::new(alias.clone()),
-                            Ident::new(dimension.sql_expr().to_string()),
-                        ]));
-                    }
-                }
-
-                Ok(Expr::CompoundIdentifier(parts))
-            }
-            Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-                left: Box::new(self.rewrite_expr(*left, model_refs)?),
-                op,
-                right: Box::new(self.rewrite_expr(*right, model_refs)?),
-            }),
-            Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
-                op,
-                expr: Box::new(self.rewrite_expr(*expr, model_refs)?),
-            }),
-            Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
-                self.rewrite_expr(*inner, model_refs)?,
-            ))),
-            _ => Ok(expr),
-        }
-    }
-
-    /// Check if projection has any aggregation functions
-    fn has_aggregations(&self, projection: &[SelectItem]) -> bool {
-        for item in projection {
-            match item {
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    if self.is_aggregation(expr) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Check if expression is an aggregation function
-    fn is_aggregation(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::Function(f) => {
-                let name = f.name.0.first().map(|i| i.value.to_uppercase());
-                matches!(
-                    name.as_deref(),
-                    Some("SUM" | "COUNT" | "AVG" | "MIN" | "MAX" | "MEDIAN")
-                )
-            }
-            _ => false,
-        }
-    }
-
-    /// Check if projection has non-aggregated columns
-    fn has_non_aggregated_columns(&self, projection: &[SelectItem]) -> bool {
-        for item in projection {
-            match item {
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    if !self.is_aggregation(expr) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Build GROUP BY clause from non-aggregated columns
-    fn build_group_by(&self, projection: &[SelectItem]) -> GroupByExpr {
-        let mut group_by_exprs = Vec::new();
-
-        for (i, item) in projection.iter().enumerate() {
-            match item {
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    if !self.is_aggregation(expr) {
-                        // Use positional reference
-                        group_by_exprs.push(Expr::Value(sqlparser::ast::Value::Number(
-                            (i + 1).to_string(),
-                            false,
-                        )));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        GroupByExpr::Expressions(group_by_exprs, vec![])
+        Expression::Paren(paren) => table_name_and_alias(&paren.this),
+        _ => None,
     }
 }
 
@@ -674,6 +233,38 @@ mod tests {
     }
 
     #[test]
+    fn retention_table_cannot_be_bound_as_a_scalar_metric() {
+        let retention: Metric = serde_json::from_value(serde_json::json!({
+            "name": "retention", "type": "retention", "entity": "user_id",
+            "cohort_event": "event_type = 'signup'", "activity_event": "event_type = 'active'",
+            "periods": 7, "retention_granularity": "day"
+        }))
+        .unwrap();
+        let mut graph = SemanticGraph::new();
+        graph
+            .add_model(
+                Model::new("events", "id")
+                    .with_table("raw_events")
+                    .with_dimension(Dimension::time("event_date"))
+                    .with_metric(retention),
+            )
+            .unwrap();
+        for sql in [
+            "SELECT events.retention FROM events",
+            "SELECT e.retention AS retained FROM events e",
+            "SELECT * FROM events",
+        ] {
+            let error = QueryRewriter::new(&graph).rewrite(sql).unwrap_err();
+            assert!(error.to_string().contains("returns a table"), "{error}");
+        }
+        let query = SemanticQuery::new().with_metrics(vec!["events.retention".into()]);
+        let sql = crate::sql::SqlGenerator::new(&graph)
+            .generate(&query)
+            .unwrap();
+        assert!(sql.contains("retention_pct"));
+    }
+
+    #[test]
     fn test_simple_rewrite() {
         let graph = create_test_graph();
         let rewriter = QueryRewriter::new(&graph);
@@ -684,6 +275,74 @@ mod tests {
         assert!(rewritten.contains("public.orders"));
         assert!(rewritten.contains("SUM("));
         assert!(rewritten.contains("GROUP BY"));
+    }
+
+    #[test]
+    fn source_normalization_and_rewrite_work_on_standard_test_stack() {
+        // This test deliberately uses the ordinary harness thread. The input
+        // normalization stage must use the production parser worker too.
+        let graph = create_test_graph();
+        for dialect in [
+            DialectType::Generic,
+            DialectType::DuckDB,
+            DialectType::PostgreSQL,
+        ] {
+            let sql =
+                "SELECT orders.revenue, orders.status FROM orders ORDER BY orders.revenue DESC";
+            let statements = parse_rewrite_input(sql, dialect).unwrap();
+            assert_eq!(statements.len(), 1);
+            let Expression::Select(select) = &statements[0] else {
+                panic!("expected select")
+            };
+            assert_eq!(select.expressions.len(), 2);
+            assert!(select.order_by.is_some());
+            let rewritten = QueryRewriter::new(&graph)
+                .rewrite_with_dialect(sql, dialect)
+                .unwrap();
+            assert!(rewritten.contains("GROUP BY"), "{rewritten}");
+            assert!(rewritten.contains("ORDER BY revenue DESC"), "{rewritten}");
+        }
+    }
+
+    #[test]
+    fn scoped_graph_metric_select_preserves_alias_order_and_pagination() {
+        let mut graph = create_test_graph();
+        graph
+            .add_metric_unvalidated(Metric::derived("total", "orders.revenue"))
+            .unwrap();
+        graph.set_metric_scopes(HashMap::new()).unwrap();
+        let sql = QueryRewriter::new(&graph)
+            .rewrite_with_dialect(
+                "SELECT total AS amount FROM metrics ORDER BY amount DESC LIMIT 2 OFFSET 1",
+                DialectType::DuckDB,
+            )
+            .unwrap();
+        let parsed = parse_sql_with_dialect(&sql, DialectType::DuckDB).unwrap();
+        let Expression::Select(select) = &parsed[0] else {
+            panic!("expected select")
+        };
+        assert_eq!(select.expressions.len(), 1);
+        assert!(
+            matches!(&select.expressions[0], Expression::Alias(alias) if alias.alias.name == "amount")
+        );
+        assert!(select.limit.is_some());
+        assert!(select.offset.is_some());
+        assert!(sql.contains("ORDER BY amount DESC"));
+    }
+
+    #[test]
+    fn scoped_metrics_rejects_unhandled_clauses_and_invalid_fields_separately() {
+        let mut graph = create_test_graph();
+        graph.set_metric_scopes(HashMap::new()).unwrap();
+        let rewriter = QueryRewriter::new(&graph);
+        assert!(matches!(
+            rewriter.rewrite("SELECT orders.revenue FROM metrics QUALIFY 1 = 1"),
+            Err(SidemanticError::UnsupportedSemanticFeatures { .. })
+        ));
+        assert!(matches!(
+            rewriter.rewrite("SELECT orders.missing FROM metrics"),
+            Err(SidemanticError::Validation(_))
+        ));
     }
 
     #[test]
@@ -730,6 +389,34 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_model_composite_join() {
+        let mut graph = SemanticGraph::new();
+
+        let shipments = Model::new("shipments", "shipment_id")
+            .with_table("public.shipments")
+            .with_metric(Metric::count("shipment_count"))
+            .with_relationship(Relationship::many_to_one("order_items").with_key_columns(
+                vec!["order_id".to_string(), "item_id".to_string()],
+                vec!["order_id".to_string(), "item_id".to_string()],
+            ));
+        let order_items = Model::new("order_items", "order_id")
+            .with_primary_key_columns(vec!["order_id".to_string(), "item_id".to_string()])
+            .with_table("public.order_items")
+            .with_dimension(Dimension::categorical("sku"));
+
+        graph.add_model(shipments).unwrap();
+        graph.add_model(order_items).unwrap();
+
+        let rewriter = QueryRewriter::new(&graph);
+        let sql = "SELECT shipments.shipment_count, order_items.sku FROM shipments";
+        let rewritten = rewriter.rewrite(sql).unwrap();
+
+        assert!(rewritten.contains(".order_id = "));
+        assert!(rewritten.contains(".item_id = "));
+        assert!(rewritten.to_uppercase().contains(" AND "));
+    }
+
+    #[test]
     fn test_cross_model_join_in_where() {
         let graph = create_test_graph();
         let rewriter = QueryRewriter::new(&graph);
@@ -750,34 +437,74 @@ mod tests {
     }
 
     #[test]
-    fn test_count_without_sql() {
-        // Test COUNT metric without explicit sql (simulates parsed definition)
+    fn test_source_uri_only_model_rejects_rewrite() {
         let mut graph = SemanticGraph::new();
+        let mut events = Model::new("events", "event_id")
+            .with_dimension(Dimension::categorical("event_type"))
+            .with_metric(Metric::count("event_count"));
+        events.source_uri = Some("s3://warehouse/events.parquet".to_string());
+        graph.add_model(events).unwrap();
 
-        // Create metric with sql: None (like what SQL parser produces)
-        let mut count_metric = Metric::new("order_count");
-        count_metric.agg = Some(crate::core::Aggregation::Count);
-        count_metric.sql = None; // Explicit None to simulate parsed metric
+        let rewriter = QueryRewriter::new(&graph);
+        let err = rewriter
+            .rewrite("SELECT events.event_count FROM events")
+            .unwrap_err();
 
-        let orders = Model::new("orders", "order_id")
-            .with_table("orders")
-            .with_dimension(Dimension::categorical("status"))
-            .with_metric(count_metric);
+        assert!(matches!(
+            err,
+            SidemanticError::ValidationIssue { ref code, .. }
+                if code == "unsupported_source_uri_query"
+        ));
+        assert!(err.to_string().contains("source_uri"));
+    }
 
-        graph.add_model(orders).unwrap();
+    #[test]
+    fn test_order_by_projected_semantic_refs_rewrite_to_output_aliases() {
+        let graph = create_test_graph();
         let rewriter = QueryRewriter::new(&graph);
 
-        let sql = "SELECT orders.order_count FROM orders";
+        let sql = "SELECT orders.revenue AS total, orders.status FROM orders ORDER BY orders.revenue DESC, orders.status ASC";
         let rewritten = rewriter.rewrite(sql).unwrap();
 
-        // Should be COUNT(*) not COUNT(order_count)
         assert!(
-            rewritten.contains("COUNT(*)"),
-            "Expected COUNT(*) but got: {rewritten}"
+            rewritten.contains("ORDER BY total DESC, status ASC"),
+            "expected ORDER BY aliases, got: {rewritten}"
         );
         assert!(
-            !rewritten.contains("order_count"),
-            "Should not contain order_count in COUNT: {rewritten}"
+            !rewritten.contains("ORDER BY orders.revenue"),
+            "semantic metric reference leaked into ORDER BY: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_order_by_projected_alias_is_preserved() {
+        let graph = create_test_graph();
+        let rewriter = QueryRewriter::new(&graph);
+
+        let sql = "SELECT orders.revenue AS total, orders.status FROM orders ORDER BY total DESC";
+        let rewritten = rewriter.rewrite(sql).unwrap();
+
+        assert!(
+            rewritten.contains("ORDER BY total DESC"),
+            "expected projected alias ORDER BY, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_order_by_order_only_semantic_metric_rewrites_to_aggregate() {
+        let graph = create_test_graph();
+        let rewriter = QueryRewriter::new(&graph);
+
+        let sql = "SELECT orders.status FROM orders ORDER BY orders.revenue DESC";
+        let rewritten = rewriter.rewrite(sql).unwrap();
+
+        assert!(
+            rewritten.contains("ORDER BY __semantic_query.__sd_field_1 DESC"),
+            "expected ordering over the compiled measure, got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("ORDER BY orders.revenue"),
+            "semantic metric reference leaked into ORDER BY: {rewritten}"
         );
     }
 }

@@ -7,6 +7,10 @@ from sidemantic.core.semantic_layer import SemanticLayer
 from sidemantic.server.connection import SemanticLayerConnection
 
 
+def _sql_string_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def map_type(duckdb_type: str) -> str:
     """Map DuckDB types to PostgreSQL types."""
     type_lower = duckdb_type.lower()
@@ -33,26 +37,43 @@ def map_type(duckdb_type: str) -> str:
 
 def start_server(
     layer: SemanticLayer,
+    host: str = "127.0.0.1",
     port: int = 5433,
     username: str | None = None,
     password: str | None = None,
+    user_attrs_map: dict[str, dict] | None = None,
 ):
     """Start PostgreSQL-compatible server for the semantic layer.
 
     Args:
         layer: Semantic layer instance
+        host: Host/IP to bind to (use 0.0.0.0 for Docker)
         port: Port to listen on
         username: Username for authentication (optional)
         password: Password for authentication (optional)
+        user_attrs_map: Optional mapping of Postgres startup username -> security
+            ``user_attributes`` dict. Loaded from --user-attrs-file at startup and
+            used to enforce model access gates per connecting user.
     """
+    if (username is None) != (password is None):
+        raise ValueError("Both username and password must be provided together")
+
+    # A user-attrs map selects each session's security attributes from the CLIENT-SUPPLIED
+    # startup username. Without password authentication, a client could connect as any key in
+    # the map (e.g. an admin) and satisfy access gates, so refuse to start in that configuration.
+    if user_attrs_map and username is None:
+        raise ValueError(
+            "A user-attrs map requires authentication: pass --username with --password-file so the "
+            "connecting username cannot be spoofed to select another user's security attributes."
+        )
 
     # Create connection class with layer injected
     class BoundConnection(SemanticLayerConnection):
         def __init__(self, connection_id, executor):
-            super().__init__(connection_id, executor, layer, username, password)
+            super().__init__(connection_id, executor, layer, username, password, user_attrs_map=user_attrs_map)
 
     # Start server
-    server = riffq.RiffqServer(f"127.0.0.1:{port}", connection_cls=BoundConnection)
+    server = riffq.RiffqServer(f"{host}:{port}", connection_cls=BoundConnection)
 
     # Register catalog
     typer.echo("Registering semantic layer catalog...", err=True)
@@ -68,11 +89,10 @@ def start_server(
 
     for schema_name, table_name in tbls:
         server._server.register_schema("sidemantic", schema_name)
-        # Use parameterized query to handle names with special characters (e.g., quotes)
-        cols_info = layer.adapter.raw_connection.execute(
+        cols_info = layer.adapter.execute(
             "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
-            "WHERE table_schema = ? AND table_name = ?",
-            [schema_name, table_name],
+            f"WHERE table_schema = {_sql_string_literal(schema_name)} "
+            f"AND table_name = {_sql_string_literal(table_name)}"
         ).fetchall()
         columns = []
         for col_name, data_type, is_nullable in cols_info:
@@ -111,7 +131,7 @@ def start_server(
     # Also register the magic 'metrics' table if there are graph-level metrics
     if layer.graph.metrics:
         metric_columns = []
-        for metric in layer.graph.metrics:
+        for metric in layer.graph.metrics.values():
             metric_columns.append({metric.name: {"type": "numeric", "nullable": True}})
 
         # Add all dimension columns from all models
@@ -134,12 +154,13 @@ def start_server(
         server._server.register_table("sidemantic", "semantic_layer", "metrics", metric_columns)
         typer.echo("  Registered table: semantic_layer.metrics", err=True)
 
-    typer.echo(f"\nStarting PostgreSQL-compatible server on 127.0.0.1:{port}", err=True)
+    typer.echo(f"\nStarting PostgreSQL-compatible server on {host}:{port}", err=True)
     if username:
         typer.echo(f"Authentication: username={username}", err=True)
     else:
         typer.echo("Authentication: disabled (any username/password accepted)", err=True)
-    typer.echo(f"\nConnect with: psql -h 127.0.0.1 -p {port} -U {username or 'any'} -d sidemantic\n", err=True)
+    connect_host = "localhost" if host == "0.0.0.0" else host
+    typer.echo(f"\nConnect with: psql -h {connect_host} -p {port} -U {username or 'any'} -d sidemantic\n", err=True)
 
     # Disable catalog_emulation and handle catalog queries manually in our Python handler
     # This prevents riffq from intercepting queries with its DataFusion parser (which fails on multi-statement queries)

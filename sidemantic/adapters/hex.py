@@ -10,6 +10,8 @@ from sidemantic.core.metric import Metric
 from sidemantic.core.model import Model
 from sidemantic.core.relationship import Relationship
 from sidemantic.core.semantic_graph import SemanticGraph
+from sidemantic.paths import output_child
+from sidemantic.yaml_compat import safe_load_all as _yaml_safe_load_all
 
 
 class HexAdapter(BaseAdapter):
@@ -49,20 +51,42 @@ class HexAdapter(BaseAdapter):
     def _parse_file(self, file_path: Path, graph: SemanticGraph) -> None:
         """Parse a single Hex YAML file.
 
+        A file may contain multiple resources separated by ``---`` (multi-document
+        YAML). Each document carries a top-level ``type:`` discriminator
+        (``model`` or ``view``). Legacy single-document files without a ``type``
+        are treated as models.
+
         Args:
             file_path: Path to YAML file
             graph: Semantic graph to add models to
         """
         with open(file_path) as f:
-            data = yaml.safe_load(f)
+            documents = _yaml_safe_load_all(f)
 
-        if not data:
-            return
+            for data in documents:
+                if not data or not isinstance(data, dict):
+                    continue
 
-        # Each file is a single model
-        model = self._parse_model(data)
-        if model:
-            graph.add_model(model)
+                model = self._parse_resource(data)
+                if model:
+                    graph.add_model(model)
+
+    def _parse_resource(self, resource_def: dict) -> Model | None:
+        """Dispatch a Hex resource to the correct parser based on ``type``.
+
+        Args:
+            resource_def: Resource definition dictionary
+
+        Returns:
+            Model instance or None
+        """
+        # ``type`` is the resource discriminator on current Hex YAML. Legacy
+        # files omit it and are always models.
+        resource_type = resource_def.get("type", "model")
+
+        if resource_type == "view":
+            return self._parse_view(resource_def)
+        return self._parse_model(resource_def)
 
     def _parse_model(self, model_def: dict) -> Model | None:
         """Parse a Hex model definition into a Model.
@@ -108,6 +132,16 @@ class HexAdapter(BaseAdapter):
             if relation:
                 relationships.append(relation)
 
+        # Visibility: public/internal/private. Only "public" stays visible.
+        visibility = model_def.get("visibility")
+        meta = {}
+        if visibility is not None:
+            meta["visibility"] = visibility
+
+        # Display label (Model has no `label`, so it rides on `metadata`).
+        name = model_def.get("name")
+        metadata = {"label": name} if name else None
+
         return Model(
             name=model_id,
             table=table,
@@ -117,6 +151,48 @@ class HexAdapter(BaseAdapter):
             relationships=relationships,
             dimensions=dimensions,
             metrics=measures,
+            metadata=metadata,
+            meta=meta or None,
+        )
+
+    def _parse_view(self, view_def: dict) -> Model | None:
+        """Parse a Hex ``view`` resource into a Model.
+
+        Views (``type: view``) are fit-for-purpose entrypoints layered on top of
+        a base model. Sidemantic has no native view concept, so the view's
+        structure (``base`` model reference and ``contents`` groups) is preserved
+        on the model's ``meta`` payload for faithful round-tripping.
+
+        Args:
+            view_def: View definition dictionary
+
+        Returns:
+            Model instance or None if parsing fails
+        """
+        view_id = view_def.get("id")
+        if not view_id:
+            return None
+
+        meta = {"hex_resource_type": "view"}
+
+        base = view_def.get("base")
+        if base is not None:
+            meta["base"] = base
+
+        contents = view_def.get("contents")
+        if contents is not None:
+            meta["contents"] = contents
+
+        name = view_def.get("name")
+        visibility = view_def.get("visibility")
+        if visibility is not None:
+            meta["visibility"] = visibility
+
+        return Model(
+            name=view_id,
+            description=view_def.get("description"),
+            metadata={"label": name} if name else None,
+            meta=meta,
         )
 
     def _parse_dimension(self, dim_def: dict) -> Dimension | None:
@@ -168,12 +244,20 @@ class HexAdapter(BaseAdapter):
             elif "timestamp" in dim_type:
                 granularity = "hour"  # Default to hour for timestamps
 
+        # Visibility: public/internal/private. Only "public" stays visible.
+        visibility = dim_def.get("visibility")
+        meta = {"visibility": visibility} if visibility is not None else None
+        public = visibility is None or visibility == "public"
+
         return Dimension(
             name=dim_id,
             type=sidemantic_type,
             sql=expr,
             granularity=granularity,
             description=dim_def.get("description"),
+            label=dim_def.get("name"),
+            public=public,
+            meta=meta,
         )
 
     def _parse_measure(self, measure_def: dict) -> Metric | None:
@@ -206,14 +290,15 @@ class HexAdapter(BaseAdapter):
                 "count_distinct": "count_distinct",
                 "sum": "sum",
                 "avg": "avg",
-                "median": "avg",  # Approximate as avg
+                "median": "median",
                 "min": "min",
                 "max": "max",
-                "stddev": "sum",  # No direct mapping
-                "stddev_pop": "sum",
-                "variance": "sum",
-                "variance_pop": "sum",
+                "stddev": "stddev",
+                "stddev_pop": "stddev_pop",
+                "variance": "variance",
+                "variance_pop": "variance_pop",
             }
+
             agg_type = type_mapping.get(func, "count")
 
             # Get the dimension being aggregated
@@ -239,6 +324,29 @@ class HexAdapter(BaseAdapter):
                 # Reference to existing dimension
                 filters.append(filter_def)
 
+        # Semi-additive measures: non-additive across the given dimension(s).
+        semi_additive = measure_def.get("semi_additive")
+        non_additive_dimension = self._parse_semi_additive(semi_additive)
+
+        # Build metadata payload.
+        meta = {}
+
+        # Visibility: public/internal/private. Only "public" stays visible.
+        visibility = measure_def.get("visibility")
+        if visibility is not None:
+            meta["visibility"] = visibility
+        public = visibility is None or visibility == "public"
+
+        # Preserve the full object-form ``semi_additive`` config so that
+        # ``pick``/``groupings`` survive a round-trip. Sidemantic only models a
+        # single ``non_additive_dimension``; without stashing the original, an
+        # export would drop ``pick`` and the Hex spec would default it to ``max``,
+        # silently corrupting opening-balance (``pick: min``) snapshots.
+        if isinstance(semi_additive, dict):
+            meta["hex_semi_additive"] = semi_additive
+
+        meta = meta or None
+
         return Metric(
             name=measure_id,
             type=metric_type,
@@ -246,7 +354,59 @@ class HexAdapter(BaseAdapter):
             sql=expr,
             filters=filters if filters else None,
             description=measure_def.get("description"),
+            label=measure_def.get("name"),
+            non_additive_dimension=non_additive_dimension,
+            public=public,
+            meta=meta,
         )
+
+    @staticmethod
+    def _parse_semi_additive(semi_additive) -> str | None:
+        """Extract the non-additive dimension from a Hex ``semi_additive`` config.
+
+        Current Hex YAML uses an object form::
+
+            semi_additive:
+              over:
+                - dimension: <dimension_id>
+                  pick: min | max
+              groupings:
+                - <dimension_id>
+
+        Legacy/shorthand string forms (e.g. ``semi_additive: last``) are also
+        accepted and ignored for the dimension extraction (there is no associated
+        dimension to record). Returns the first ``over`` dimension id, which maps
+        to Sidemantic's single ``non_additive_dimension``.
+
+        Args:
+            semi_additive: Raw value of the ``semi_additive`` field
+
+        Returns:
+            Dimension id the measure is non-additive across, or None
+        """
+        if not semi_additive:
+            return None
+
+        if isinstance(semi_additive, dict):
+            over = semi_additive.get("over") or []
+            for entry in over:
+                if isinstance(entry, dict) and entry.get("dimension") is not None:
+                    dimension = entry["dimension"]
+                    # The Hex spec allows ``dimension`` to be either a bare
+                    # dimension id or an inline Dimension object (``{id: ...}``).
+                    # Sidemantic's ``non_additive_dimension`` is a plain string,
+                    # so extract the id from the object form.
+                    if isinstance(dimension, dict):
+                        dimension_id = dimension.get("id")
+                        if isinstance(dimension_id, str):
+                            return dimension_id
+                        continue
+                    if isinstance(dimension, str):
+                        return dimension
+                    continue
+                if isinstance(entry, str):
+                    return entry
+        return None
 
     def _parse_relation(self, relation_def: dict) -> Relationship | None:
         """Parse Hex relation into Sidemantic relationship.
@@ -284,10 +444,10 @@ class HexAdapter(BaseAdapter):
                 foreign_key = parts[0].strip()
 
         return Relationship(
-            name=target,
+            name=relation_id,
+            target_model=target if target != relation_id else None,
             type=sidemantic_type,
             foreign_key=foreign_key,
-            sql_expr=join_sql if join_sql else None,
         )
 
     def export(self, graph: SemanticGraph, output_path: str | Path) -> None:
@@ -319,7 +479,7 @@ class HexAdapter(BaseAdapter):
             output_path.mkdir(parents=True, exist_ok=True)
             for model in resolved_models.values():
                 model_data = self._export_model(model, graph)
-                model_file = output_path / f"{model.name}.yml"
+                model_file = output_child(output_path, f"{model.name}.yml")
                 with open(model_file, "w") as f:
                     yaml.dump(model_data, f, sort_keys=False, default_flow_style=False)
 
@@ -333,20 +493,37 @@ class HexAdapter(BaseAdapter):
         Returns:
             Model definition dictionary
         """
-        model_def = {"id": model.name}
+        meta = model.meta or {}
 
-        if model.table:
-            model_def["base_sql_table"] = model.table
-        elif model.sql:
+        # Round-trip Hex views back to ``type: view`` resources.
+        if meta.get("hex_resource_type") == "view":
+            return self._export_view(model)
+
+        # ``type`` is the resource discriminator required on current Hex YAML.
+        model_def = {"id": model.name, "type": "model"}
+
+        label = (model.metadata or {}).get("label")
+        if label:
+            model_def["name"] = label
+
+        if model.sql:
             model_def["base_sql_query"] = model.sql
+        elif model.table:
+            model_def["base_sql_table"] = model.table
 
         if model.description:
             model_def["description"] = model.description
+
+        if meta.get("visibility"):
+            model_def["visibility"] = meta["visibility"]
 
         # Export dimensions
         dimensions = []
         for dim in model.dimensions:
             dim_def = {"id": dim.name}
+
+            if dim.label:
+                dim_def["name"] = dim.label
 
             # Map Sidemantic types to Hex types
             type_mapping = {
@@ -376,6 +553,13 @@ class HexAdapter(BaseAdapter):
             if dim.description:
                 dim_def["description"] = dim.description
 
+            # Visibility: prefer recorded value, otherwise derive from public flag.
+            dim_visibility = (dim.meta or {}).get("visibility")
+            if dim_visibility:
+                dim_def["visibility"] = dim_visibility
+            elif not dim.public:
+                dim_def["visibility"] = "internal"
+
             # Mark unique dimensions
             if dim.name == model.primary_key:
                 dim_def["unique"] = True
@@ -389,6 +573,9 @@ class HexAdapter(BaseAdapter):
         measures = []
         for metric in model.metrics:
             measure_def = {"id": metric.name}
+
+            if metric.label:
+                measure_def["name"] = metric.label
 
             # Handle different metric types
             if metric.type == "derived":
@@ -427,6 +614,22 @@ class HexAdapter(BaseAdapter):
             if metric.description:
                 measure_def["description"] = metric.description
 
+            # Semi-additive: prefer the preserved object-form config (keeps
+            # ``pick``/``groupings`` intact on round-trip), otherwise emit the
+            # minimal form derived from ``non_additive_dimension``.
+            preserved_semi_additive = (metric.meta or {}).get("hex_semi_additive")
+            if preserved_semi_additive:
+                measure_def["semi_additive"] = preserved_semi_additive
+            elif metric.non_additive_dimension:
+                measure_def["semi_additive"] = {"over": [{"dimension": metric.non_additive_dimension}]}
+
+            # Visibility: prefer recorded value, otherwise derive from public flag.
+            measure_visibility = (metric.meta or {}).get("visibility")
+            if measure_visibility:
+                measure_def["visibility"] = measure_visibility
+            elif not metric.public:
+                measure_def["visibility"] = "internal"
+
             measures.append(measure_def)
 
         if measures:
@@ -439,13 +642,13 @@ class HexAdapter(BaseAdapter):
                 "id": rel.name,
                 "type": rel.type,
             }
+            if rel.name != rel.related_model:
+                relation_def["target"] = rel.related_model
 
             # Build join_sql
-            if rel.sql_expr:
-                relation_def["join_sql"] = rel.sql_expr
-            elif rel.foreign_key:
+            if rel.foreign_key:
                 # Construct join condition
-                relation_def["join_sql"] = f"{rel.foreign_key} = ${{{rel.name}}}.id"
+                relation_def["join_sql"] = f"{rel.foreign_key} = ${{{rel.name}}}.{rel.primary_key or 'id'}"
 
             relations.append(relation_def)
 
@@ -453,3 +656,36 @@ class HexAdapter(BaseAdapter):
             model_def["relations"] = relations
 
         return model_def
+
+    def _export_view(self, model: Model) -> dict:
+        """Export a model that was imported from a Hex ``view`` resource.
+
+        Reconstructs the ``type: view`` resource from the metadata captured during
+        import (``base`` and ``contents``).
+
+        Args:
+            model: Model carrying ``hex_resource_type == "view"`` metadata
+
+        Returns:
+            View definition dictionary
+        """
+        meta = model.meta or {}
+        view_def = {"id": model.name, "type": "view"}
+
+        label = (model.metadata or {}).get("label")
+        if label:
+            view_def["name"] = label
+
+        if model.description:
+            view_def["description"] = model.description
+
+        if meta.get("visibility"):
+            view_def["visibility"] = meta["visibility"]
+
+        if meta.get("base") is not None:
+            view_def["base"] = meta["base"]
+
+        if meta.get("contents") is not None:
+            view_def["contents"] = meta["contents"]
+
+        return view_def

@@ -4,6 +4,7 @@ These should have been included in the original commit but weren't.
 """
 
 import pytest
+from sqlglot import exp, parse_one
 
 from sidemantic import Dimension, Metric, Model
 from sidemantic.core.table_calculation import TableCalculation
@@ -130,8 +131,9 @@ def test_conversion_metrics_use_correct_model(layer):
     # Should find events model (which has the conversion metric), not users
     sql = layer.compile(metrics=["events.conversion_rate"], dimensions=["events.timestamp__month"])
 
-    # Should reference events_table, not users_table
-    assert "events_table" in sql or "events" in sql.lower()
+    # Should reference events_table and never users_table
+    assert "FROM events_table" in sql
+    assert "users_table" not in sql
 
 
 def test_conversion_metrics_handle_table_backed_models(layer):
@@ -165,8 +167,9 @@ def test_conversion_metrics_handle_table_backed_models(layer):
 
     sql = layer.compile(metrics=["events.conversion_rate"], dimensions=["events.timestamp__month"])
 
-    # Should reference events_table directly, not (None)
-    assert "FROM events_table" in sql or "FROM (None)" not in sql
+    # Should reference events_table directly, never (None)
+    assert "FROM events_table" in sql
+    assert "FROM (None)" not in sql
 
 
 def test_derived_metric_substitution_uses_word_boundaries(layer):
@@ -194,33 +197,68 @@ def test_derived_metric_substitution_uses_word_boundaries(layer):
 
     sql = layer.compile(metrics=["orders.net_revenue"], dimensions=["orders.region"])
 
-    # Should have correct references, not mangled
-    # gross_revenue should stay as gross_revenue, not become gross_(SUM(...))
-    assert "gross_revenue" in sql or "GROSS_REVENUE" in sql
+    # Should substitute both dependencies without mangling names
+    assert "SUM(orders_cte.gross_revenue_raw)" in sql
+    assert "SUM(orders_cte.revenue_raw)" in sql
 
 
-def test_end_to_end_duckdb_coverage():
-    """Test that end-to-end tests actually run queries, not just pass.
+def test_model_ref_rewrite_matches_cte_identifier_quoting(layer):
+    """CTE ref rewriting should follow the same identifier quoting as CTE definitions."""
+    layer.dialect = "postgres"
+    orders = Model(
+        name="ORDERS",
+        table="orders_table",
+        primary_key="order_id",
+        dimensions=[
+            Dimension(name="amount", type="numeric"),
+        ],
+        metrics=[
+            Metric(name="inline_total", type="derived", sql="SUM(ORDERS.amount)"),
+        ],
+    )
+    layer.add_model(orders)
 
-    Bug: test_with_data.py had all tests as TODO with 'pass', no real verification.
-    Fix: Implemented real tests with data verification.
-    """
-    # This is tested in test_with_data.py - just verify that file has real tests
-    import os
+    sql = layer.compile(metrics=["ORDERS.inline_total"])
 
-    test_file = os.path.join(os.path.dirname(__file__), "test_with_data.py")
-    assert os.path.exists(test_file), "test_with_data.py should exist"
+    parsed = parse_one(sql, dialect="postgres")
+    cte = next(cte for cte in parsed.find_all(exp.CTE) if cte.alias == "ORDERS_cte")
+    definition = cte.args["alias"].this
+    references = [table.this for table in parsed.find_all(exp.Table) if table.name == cte.alias]
+    references.extend(column.args["table"] for column in parsed.find_all(exp.Column) if column.table == cte.alias)
+    assert references
+    assert all(ref.args.get("quoted", False) == definition.args.get("quoted", False) for ref in references)
+    layer.conn.execute("CREATE TABLE orders_table (order_id INTEGER, amount INTEGER)")
+    layer.conn.execute("INSERT INTO orders_table VALUES (1, 10), (2, 25)")
+    assert layer.conn.execute(sql).fetchall() == [(35,)]
 
-    # Read the file and verify it doesn't just have 'pass' statements
-    with open(test_file) as f:
-        content = f.read()
 
-    # Count actual assertion statements vs pass statements
-    assertion_count = content.count("assert ")
-    pass_count = content.count("\n    pass")
+def test_inline_aggregate_dependency_alias_uses_identifier_quoting(layer):
+    orders = Model(
+        name="orders",
+        table="orders_table",
+        primary_key="id",
+        dimensions=[
+            Dimension(name="id", type="numeric"),
+            Dimension(name="amount", type="numeric"),
+            Dimension(name="order total", type="categorical", sql='"order total"'),
+        ],
+        metrics=[
+            Metric(
+                name="inline_total",
+                sql='SUM("order total") + 0',
+            ),
+        ],
+    )
+    layer.add_model(orders)
 
-    # Should have more assertions than passes (real tests, not TODOs)
-    assert assertion_count > pass_count, "test_with_data.py should have real tests, not just pass statements"
+    sql = layer.compile(metrics=["orders.inline_total"])
+
+    columns = [column for column in parse_one(sql).find_all(exp.Column) if column.name == "order total"]
+    assert columns
+    assert all(column.this.args.get("quoted") for column in columns)
+    layer.conn.execute('CREATE TABLE orders_table (id INTEGER, amount INTEGER, "order total" INTEGER)')
+    layer.conn.execute("INSERT INTO orders_table VALUES (1, 100, 10), (2, 200, 25)")
+    assert layer.conn.execute(sql).fetchall() == [(35,)]
 
 
 def test_count_metrics_with_filters(layer):
@@ -251,6 +289,22 @@ def test_count_metrics_with_filters(layer):
     assert "status = 'completed'" in sql
     # Should not have invalid * AS syntax
     assert "* AS completed_orders_raw" not in sql
+
+
+def test_filtered_count_expression_preserves_nulls(layer):
+    layer.add_model(
+        Model(
+            name="orders",
+            sql="SELECT * FROM (VALUES (10, true), (NULL, true), (10, true), (20, false)) AS t(amount, active)",
+            metrics=[
+                Metric(name="rows", agg="count", filters=["active"]),
+                Metric(name="values", agg="count", sql="amount", filters=["active"]),
+                Metric(name="distinct_values", agg="count_distinct", sql="amount", filters=["active"]),
+            ],
+        )
+    )
+
+    assert layer.query(metrics=["orders.rows", "orders.values", "orders.distinct_values"]).fetchall() == [(3, 2, 1)]
 
 
 def test_table_calculation_with_division():
@@ -293,3 +347,213 @@ def test_safe_eval_arithmetic_operations_work():
     assert processor._safe_eval("2 ** 3") == 8
     assert processor._safe_eval("-(5 + 3)") == -8
     assert processor._safe_eval("(10 + 5) * 2") == 30
+
+
+def test_conversion_invalid_entity_rejected():
+    """Conversion metric rejects entity names with SQL injection."""
+    from sidemantic.core.semantic_graph import SemanticGraph
+    from sidemantic.sql.generator import SQLGenerator
+
+    events = Model(
+        name="events",
+        table="events_table",
+        primary_key="event_id",
+        dimensions=[
+            Dimension(name="event_id", type="numeric"),
+            Dimension(name="user_id", type="numeric"),
+            Dimension(name="event_type", type="categorical"),
+            Dimension(name="event_time", type="time"),
+        ],
+        metrics=[
+            Metric(
+                name="conv",
+                type="conversion",
+                entity="user_id; DROP TABLE--",
+                base_event="signup",
+                conversion_event="purchase",
+                conversion_window="7 days",
+            ),
+        ],
+    )
+    graph = SemanticGraph()
+    graph.add_model(events)
+    gen = SQLGenerator(graph)
+
+    with pytest.raises(ValueError, match="Invalid entity"):
+        gen.generate(metrics=["events.conv"], dimensions=["events.event_time"])
+
+
+def test_conversion_invalid_window_rejected():
+    """Conversion metric rejects window values with SQL injection."""
+    from sidemantic.core.semantic_graph import SemanticGraph
+    from sidemantic.sql.generator import SQLGenerator
+
+    events = Model(
+        name="events",
+        table="events_table",
+        primary_key="event_id",
+        dimensions=[
+            Dimension(name="event_id", type="numeric"),
+            Dimension(name="user_id", type="numeric"),
+            Dimension(name="event_type", type="categorical"),
+            Dimension(name="event_time", type="time"),
+        ],
+        metrics=[
+            Metric(
+                name="conv",
+                type="conversion",
+                entity="user_id",
+                base_event="signup",
+                conversion_event="purchase",
+                conversion_window="7;DROP days",
+            ),
+        ],
+    )
+    graph = SemanticGraph()
+    graph.add_model(events)
+    gen = SQLGenerator(graph)
+
+    with pytest.raises(ValueError, match="Invalid window"):
+        gen.generate(metrics=["events.conv"], dimensions=["events.event_time"])
+
+
+def test_conversion_event_name_quotes_escaped():
+    """Conversion metric escapes single quotes in event names."""
+    from sidemantic.core.semantic_graph import SemanticGraph
+    from sidemantic.sql.generator import SQLGenerator
+
+    events = Model(
+        name="events",
+        table="events_table",
+        primary_key="event_id",
+        dimensions=[
+            Dimension(name="event_id", type="numeric"),
+            Dimension(name="user_id", type="numeric"),
+            Dimension(name="event_type", type="categorical"),
+            Dimension(name="event_time", type="time"),
+        ],
+        metrics=[
+            Metric(
+                name="conv",
+                type="conversion",
+                entity="user_id",
+                base_event="sign'up",
+                conversion_event="pur'chase",
+                conversion_window="7 days",
+            ),
+        ],
+    )
+    graph = SemanticGraph()
+    graph.add_model(events)
+    gen = SQLGenerator(graph)
+
+    sql = gen.generate(metrics=["events.conv"], dimensions=["events.event_time"])
+    assert "sign''up" in sql
+    assert "pur''chase" in sql
+
+
+def test_count_fanout_uses_column_reference():
+    """COUNT metric uses column reference instead of COUNT(*) to prevent fan-out."""
+    from sidemantic.core.semantic_graph import SemanticGraph
+    from sidemantic.sql.generator import SQLGenerator
+
+    orders = Model(
+        name="orders",
+        table="orders_table",
+        primary_key="order_id",
+        dimensions=[Dimension(name="region", type="categorical")],
+        metrics=[Metric(name="order_count", agg="count", sql="order_id")],
+    )
+    graph = SemanticGraph()
+    graph.add_model(orders)
+    gen = SQLGenerator(graph)
+
+    sql = gen.generate(metrics=["orders.order_count"], dimensions=["orders.region"])
+    assert "COUNT(*)" not in sql
+    assert "COUNT(orders_cte.order_count_raw) AS order_count" in sql
+
+
+def test_conversion_metric_executes_with_expected_rate(layer):
+    """Conversion metric should execute and return a deterministic monthly rate."""
+    events = Model(
+        name="events",
+        table="events_table",
+        primary_key="event_id",
+        dimensions=[
+            Dimension(name="event_id", type="numeric"),
+            Dimension(name="user_id", type="numeric"),
+            Dimension(name="event_type", type="categorical"),
+            Dimension(name="timestamp", type="time", granularity="day"),
+        ],
+        metrics=[
+            Metric(
+                name="conversion_rate",
+                type="conversion",
+                entity="user_id",
+                base_event="signup",
+                conversion_event="purchase",
+                conversion_window="30 days",
+            ),
+        ],
+    )
+    layer.add_model(events)
+
+    layer.conn.execute(
+        """
+        CREATE TABLE events_table (
+            event_id INTEGER,
+            user_id INTEGER,
+            event_type VARCHAR,
+            timestamp TIMESTAMP
+        )
+        """
+    )
+    layer.conn.execute(
+        """
+        INSERT INTO events_table VALUES
+            (1, 1, 'signup', '2024-01-01'),
+            (2, 1, 'purchase', '2024-01-05'),
+            (3, 2, 'signup', '2024-01-02'),
+            (4, 3, 'signup', '2024-01-03'),
+            (5, 3, 'purchase', '2024-02-20')
+        """
+    )
+
+    sql = layer.compile(metrics=["events.conversion_rate"], dimensions=["events.timestamp__month"])
+    rows = layer.conn.execute(sql).fetchall()
+
+    assert len(rows) == 1
+    month_value, conversion_rate = rows[0]
+    assert month_value is not None
+    assert conversion_rate == pytest.approx(1.0 / 3.0, abs=1e-6)
+
+
+def test_build_interval_duckdb():
+    """_build_interval produces correct DuckDB INTERVAL syntax."""
+    from sidemantic.core.semantic_graph import SemanticGraph
+    from sidemantic.sql.generator import SQLGenerator
+
+    graph = SemanticGraph()
+    gen = SQLGenerator(graph, dialect="duckdb")
+    assert gen._build_interval("7", "days") == "INTERVAL '7 days'"
+
+
+def test_build_interval_bigquery():
+    """_build_interval produces correct BigQuery INTERVAL syntax."""
+    from sidemantic.core.semantic_graph import SemanticGraph
+    from sidemantic.sql.generator import SQLGenerator
+
+    graph = SemanticGraph()
+    gen = SQLGenerator(graph, dialect="bigquery")
+    assert gen._build_interval("7", "days") == "INTERVAL 7 DAY"
+    assert gen._build_interval("3", "months") == "INTERVAL 3 MONTH"
+
+
+def test_build_interval_postgres():
+    """_build_interval produces correct Postgres INTERVAL syntax."""
+    from sidemantic.core.semantic_graph import SemanticGraph
+    from sidemantic.sql.generator import SQLGenerator
+
+    graph = SemanticGraph()
+    gen = SQLGenerator(graph, dialect="postgres")
+    assert gen._build_interval("30", "days") == "INTERVAL '30 days'"

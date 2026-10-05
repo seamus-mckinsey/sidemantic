@@ -1,0 +1,59 @@
+import { describe, expect, test } from "bun:test";
+import {
+  brushDateRange,
+  canBatchMetric,
+  chronologicalSeriesRows,
+  isCurrentQueryResult,
+  resolveExpandedLeaderboard,
+} from "./ExplorerView";
+
+describe("canBatchMetric", () => {
+  test.each(["cohort", "conversion", "retention"])("keeps %s metrics out of aggregate strip queries", (type) => {
+    expect(canBatchMetric({ type })).toBe(false);
+  });
+
+  test.each([undefined, "ratio", "derived", "cumulative", "time_comparison"])(
+    "allows composable metric type %s in aggregate strip queries",
+    (type) => {
+      expect(canBatchMetric({ type })).toBe(true);
+    },
+  );
+});
+
+describe("isCurrentQueryResult", () => {
+  test("rejects rows produced by the previously selected dedicated metric", () => {
+    expect(isCurrentQueryResult('{"metrics":["events.retention"]}', '{"metrics":["events.conversion"]}')).toBe(false);
+  });
+
+  test("accepts rows produced by the active dedicated metric", () => {
+    const key = '{"metrics":["events.retention"]}';
+    expect(isCurrentQueryResult(key, key)).toBe(true);
+  });
+});
+
+describe("resolveExpandedLeaderboard", () => {
+  test("clears an expansion that is not available on the active dashboard tab", () => {
+    expect(resolveExpandedLeaderboard("orders.status", [{ ref: "customers.country" }])).toBeNull();
+  });
+
+  test("keeps an expansion that belongs to the active dashboard tab", () => {
+    expect(resolveExpandedLeaderboard("customers.country", [{ ref: "customers.country" }])).toBe(
+      "customers.country",
+    );
+  });
+});
+
+test("chronologicalSeriesRows restores display order after a latest-first capped query", () => {
+  const rows = [
+    { bucket: "2024-01-01T00:02:00", revenue: 2 },
+    { bucket: "2024-01-01T00:01:00", revenue: 1 },
+  ];
+  expect(chronologicalSeriesRows(rows, "bucket").map((row) => row.revenue)).toEqual([1, 2]);
+});
+
+test("brushDateRange preserves fine-grain timestamp bounds", () => {
+  expect(brushDateRange({ from: "2024-01-01T00:01:00", to: "2024-01-01T00:02:00" }, "minute")).toEqual({
+    from: "2024-01-01T00:01:00",
+    to: "2024-01-01T00:03:00",
+  });
+});

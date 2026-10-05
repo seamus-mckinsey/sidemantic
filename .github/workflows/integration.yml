@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  # Non-PR runs get a unique suffix so queued main runs are retained too.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   postgres-integration:
     runs-on: ubuntu-latest
@@ -28,10 +33,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        id: uv
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
 
       - name: Set up Python
         run: uv python install 3.12
@@ -48,7 +64,9 @@ jobs:
           POSTGRES_DB: "sidemantic_test"
           POSTGRES_USER: "test"
           POSTGRES_PASSWORD: "test"
-        run: uv run pytest -m integration tests/db/test_postgres_integration.py -v
+        run: |
+          uv run pytest --test-engine python -m integration tests/db/test_postgres_integration.py -v
+          uv run pytest --test-engine rust -m integration tests/db/test_postgres_integration.py -v
 
       - name: Run PostgreSQL CLI e2e test
         env:
@@ -58,7 +76,16 @@ jobs:
           POSTGRES_DB: "sidemantic_test"
           POSTGRES_USER: "test"
           POSTGRES_PASSWORD: "test"
-        run: uv run pytest -m integration tests/db/test_postgres_cli_e2e.py -v
+        run: |
+          uv run pytest --test-engine python -m integration tests/db/test_postgres_cli_e2e.py -v
+          uv run pytest --test-engine rust -m integration tests/db/test_postgres_cli_e2e.py -v
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
 
   bigquery-integration:
     runs-on: ubuntu-latest
@@ -66,20 +93,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
       - name: Start BigQuery emulator
         run: |
           docker run -d --name bigquery-emulator \
             -p 9050:9050 \
-            ghcr.io/goccy/bigquery-emulator:latest \
+            ghcr.io/goccy/bigquery-emulator:0.8.1 \
             --project=test-project --dataset=test_dataset
 
           # Wait for emulator to be ready
           sleep 5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        id: uv
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
 
       - name: Set up Python
         run: uv python install 3.12
@@ -93,7 +131,16 @@ jobs:
           BIGQUERY_EMULATOR_HOST: "localhost:9050"
           BIGQUERY_PROJECT: "test-project"
           BIGQUERY_DATASET: "test_dataset"
-        run: uv run pytest -m integration tests/db/test_bigquery_integration.py -v
+        run: |
+          uv run pytest --test-engine python -m integration tests/db/test_bigquery_integration.py -v
+          uv run pytest --test-engine rust -m integration tests/db/test_bigquery_integration.py -v
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
 
   snowflake-integration:
     runs-on: ubuntu-latest
@@ -101,10 +148,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        id: uv
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
 
       - name: Set up Python
         run: uv python install 3.12
@@ -112,17 +170,29 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra snowflake --extra dev
 
+      - name: Install fakesnow
+        run: uv pip install "fakesnow==0.11.11"
+
       - name: Run Snowflake integration tests
         env:
           SNOWFLAKE_TEST: "1"
-        run: uv run pytest -m integration tests/db/test_snowflake_integration.py -v
+        run: |
+          uv run pytest --test-engine python -m integration tests/db/test_snowflake_integration.py -v
+          uv run pytest --test-engine rust -m integration tests/db/test_snowflake_integration.py -v
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
 
   clickhouse-integration:
     runs-on: ubuntu-latest
 
     services:
       clickhouse:
-        image: clickhouse/clickhouse-server:latest
+        image: clickhouse/clickhouse-server:25.8.28.1-alpine
         env:
           CLICKHOUSE_DB: default
           CLICKHOUSE_USER: default
@@ -131,7 +201,7 @@ jobs:
         ports:
           - 8123:8123
         options: >-
-          --health-cmd "wget --spider -q localhost:8123/ping"
+          --health-cmd "clickhouse-client --user default --password clickhouse --query 'SELECT 1'"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -139,10 +209,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        id: uv
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
 
       - name: Set up Python
         run: uv python install 3.12
@@ -156,4 +237,200 @@ jobs:
           CLICKHOUSE_HOST: "localhost"
           CLICKHOUSE_PORT: "8123"
           CLICKHOUSE_PASSWORD: "clickhouse"
-        run: uv run pytest -m integration tests/db/test_clickhouse_integration.py -v
+        run: |
+          uv run pytest --test-engine python -m integration tests/db/test_clickhouse_integration.py -v
+          uv run pytest --test-engine rust -m integration tests/db/test_clickhouse_integration.py -v
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}
+
+  adbc-integration:
+    name: ADBC integration (${{ matrix.db }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, duckdb, postgres, bigquery, snowflake, clickhouse]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: sidemantic_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8.28.1-alpine
+        env:
+          CLICKHOUSE_DB: default
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user default --query 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust for Rust ADBC probe
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust compilation
+        id: rust-cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Start BigQuery emulator
+        if: matrix.db == 'bigquery'
+        run: |
+          docker run -d --name bigquery-emulator \
+            -p 9050:9050 \
+            ghcr.io/goccy/bigquery-emulator:0.8.1 \
+            --project=test-project --dataset=test_dataset
+          sleep 5
+
+      - name: Install uv
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+          suffix: ${{ github.workflow }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra adbc
+
+      - name: Install ADBC driver through dbc
+        run: |
+          DRIVER_DIR="$HOME/.config/adbc/drivers"
+          echo "ADBC_DRIVER_PATH=$DRIVER_DIR" >> "$GITHUB_ENV"
+
+          DB="${{ matrix.db }}"
+          DRIVER="$DB"
+          if [ "$DB" = "postgres" ]; then
+            DRIVER="postgresql"
+          fi
+          if [ "$DB" = "clickhouse" ]; then
+            uv run --with dbc dbc install --level user --pre clickhouse
+            uv run --with dbc dbc list --level user
+            exit 0
+          fi
+          uv run --with dbc dbc install --level user "$DRIVER"
+          uv run --with dbc dbc list --level user
+
+      - name: Run Python ADBC smoke tests
+        if: matrix.db != 'sqlite' && matrix.db != 'duckdb'
+        env:
+          ADBC_TEST: "1"
+          ADBC_DB: ${{ matrix.db }}
+          POSTGRES_URL: "postgres://test:test@localhost:5432/sidemantic_test"
+          BIGQUERY_EMULATOR_HOST: "localhost:9050"
+          BIGQUERY_PROJECT: "test-project"
+          BIGQUERY_DATASET: "test_dataset"
+          CLICKHOUSE_HOST: "localhost"
+          CLICKHOUSE_PORT: "8123"
+          SNOWFLAKE_TEST: "1"
+        run: |
+          uv run pytest --test-engine python -m integration tests/db/test_adbc_ci_smoke.py -v
+          uv run pytest --test-engine rust -m integration tests/db/test_adbc_ci_smoke.py -v
+
+      - name: Export SQLite ADBC driver for Rust
+        if: matrix.db == 'sqlite'
+        run: |
+          echo "SIDEMANTIC_TEST_ADBC_SQLITE_DRIVER=sqlite" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_SQLITE_URI=:memory:" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_REQUIRE=sqlite" >> "$GITHUB_ENV"
+
+      - name: Export DuckDB ADBC driver for Rust
+        if: matrix.db == 'duckdb'
+        run: |
+          echo "SIDEMANTIC_TEST_ADBC_DUCKDB_DRIVER=duckdb" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_REQUIRE=duckdb" >> "$GITHUB_ENV"
+
+      - name: Export Postgres ADBC driver for Rust
+        if: matrix.db == 'postgres'
+        run: |
+          echo "SIDEMANTIC_TEST_ADBC_POSTGRES_DRIVER=postgresql" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_POSTGRES_URI=postgresql://test:test@localhost:5432/sidemantic_test" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_REQUIRE=postgres" >> "$GITHUB_ENV"
+
+      - name: Export BigQuery ADBC driver for Rust
+        if: matrix.db == 'bigquery'
+        env:
+          BIGQUERY_ADBC_CREDENTIALS_JSON: ${{ secrets.BIGQUERY_ADBC_CREDENTIALS_JSON }}
+          BIGQUERY_ADBC_PROJECT: ${{ vars.BIGQUERY_ADBC_PROJECT }}
+          BIGQUERY_ADBC_DATASET: ${{ vars.BIGQUERY_ADBC_DATASET }}
+        run: |
+          if [ -z "$BIGQUERY_ADBC_CREDENTIALS_JSON" ] || [ -z "$BIGQUERY_ADBC_PROJECT" ] || [ -z "$BIGQUERY_ADBC_DATASET" ]; then
+            echo "Skipping Rust BigQuery ADBC probe; BIGQUERY_ADBC_CREDENTIALS_JSON secret plus BIGQUERY_ADBC_PROJECT/BIGQUERY_ADBC_DATASET vars are required."
+            exit 0
+          fi
+          CREDENTIALS_FILE="$(mktemp)"
+          printf '%s' "$BIGQUERY_ADBC_CREDENTIALS_JSON" > "$CREDENTIALS_FILE"
+          echo "::add-mask::$BIGQUERY_ADBC_CREDENTIALS_JSON"
+          echo "SIDEMANTIC_TEST_ADBC_BIGQUERY_DRIVER=bigquery" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_BIGQUERY_DBOPTS=adbc.bigquery.sql.project_id=$BIGQUERY_ADBC_PROJECT,adbc.bigquery.sql.dataset_id=$BIGQUERY_ADBC_DATASET,adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_file,adbc.bigquery.sql.auth_credentials=$CREDENTIALS_FILE" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_REQUIRE=bigquery" >> "$GITHUB_ENV"
+
+      - name: Export Snowflake ADBC driver for Rust
+        if: matrix.db == 'snowflake'
+        env:
+          SNOWFLAKE_ADBC_URI: ${{ secrets.SNOWFLAKE_ADBC_URI }}
+        run: |
+          if [ -z "$SNOWFLAKE_ADBC_URI" ]; then
+            echo "Skipping Rust Snowflake ADBC probe; SNOWFLAKE_ADBC_URI secret is required."
+            exit 0
+          fi
+          echo "::add-mask::$SNOWFLAKE_ADBC_URI"
+          echo "SIDEMANTIC_TEST_ADBC_SNOWFLAKE_DRIVER=snowflake" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_SNOWFLAKE_URI=$SNOWFLAKE_ADBC_URI" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_REQUIRE=snowflake" >> "$GITHUB_ENV"
+
+      - name: Export ClickHouse ADBC driver for Rust
+        if: matrix.db == 'clickhouse'
+        run: |
+          echo "SIDEMANTIC_TEST_ADBC_CLICKHOUSE_DRIVER=clickhouse" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_CLICKHOUSE_URI=http://localhost:8123/" >> "$GITHUB_ENV"
+          echo "SIDEMANTIC_TEST_ADBC_REQUIRE=clickhouse" >> "$GITHUB_ENV"
+
+      - name: Run Rust ADBC semantic smoke
+        env:
+          SIDEMANTIC_ADBC_TESTS: "1"
+          SIDEMANTIC_ADBC_DB: ${{ matrix.db }}
+          SIDEMANTIC_ADBC_REQUIRED: ${{ contains(fromJSON('["sqlite","duckdb","postgres","clickhouse"]'), matrix.db) }}
+          POSTGRES_URL: "postgres://test:test@localhost:5432/sidemantic_test"
+          BIGQUERY_EMULATOR_HOST: "localhost:9050"
+          BIGQUERY_PROJECT: "test-project"
+          BIGQUERY_DATASET: "test_dataset"
+          CLICKHOUSE_URL: "adbc://clickhouse?uri=http://localhost:8123/"
+          SNOWFLAKE_TEST: "1"
+          RUST_MIN_STACK: 16777216
+        run: cargo test --manifest-path sidemantic-rs/Cargo.toml --features adbc-exec --test adbc_engines -- --nocapture
+
+      - name: Run Rust ADBC probe
+        run: cargo test --manifest-path sidemantic-rs/Cargo.toml --features adbc-exec --test adbc_driver_matrix
+
+      - name: Save completed build caches
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-build-caches
+        with:
+          rust-key: ${{ steps.rust-cache.outputs.key }}
+          uv-key: ${{ steps.uv.outputs.cache-key }}

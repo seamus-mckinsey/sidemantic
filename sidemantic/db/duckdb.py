@@ -14,11 +14,21 @@ class DuckDBAdapter(BaseDatabaseAdapter):
     Wraps DuckDB connection to provide unified adapter interface.
     """
 
-    def __init__(self, path: str = ":memory:", read_only: bool = False, config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        path: str = ":memory:",
+        read_only: bool = False,
+        config: dict[str, Any] | None = None,
+        init_sql: list[str] | None = None,
+    ):
         """Initialize DuckDB adapter.
 
         Args:
             path: Database file path or ":memory:" for in-memory database
+            read_only: Open database in read-only mode
+            config: DuckDB configuration options
+            init_sql: SQL statements to run immediately after connecting
+                (e.g., loading extensions, attaching catalogs, creating secrets)
         """
         if not read_only and config is None:
             self.conn = duckdb.connect(path)
@@ -26,6 +36,22 @@ class DuckDBAdapter(BaseDatabaseAdapter):
             self.conn = duckdb.connect(path, read_only=read_only)
         else:
             self.conn = duckdb.connect(path, read_only=read_only, config=config)
+
+        if init_sql:
+            for stmt in init_sql:
+                self.conn.execute(stmt)
+
+    def cursor(self) -> Any:
+        """Return an independent DuckDB cursor for concurrent reads.
+
+        In duckdb-python, ``conn.cursor()`` creates a new connection that shares
+        the same underlying database. This is the sanctioned pattern for
+        multithreaded reads: each thread gets its own handle, so concurrent
+        ``execute`` calls do not serialize on a single connection. The returned
+        cursor exposes ``execute`` returning a relation with ``fetch_record_batch``
+        and ``fetchone``, matching the result API used across the codebase.
+        """
+        return self.conn.cursor()
 
     def execute(self, sql: str) -> Any:
         """Execute SQL and return DuckDB relation."""
@@ -88,11 +114,12 @@ class DuckDBAdapter(BaseDatabaseAdapter):
         return self.conn
 
     @classmethod
-    def from_url(cls, url: str) -> "DuckDBAdapter":
+    def from_url(cls, url: str, init_sql: list[str] | None = None) -> "DuckDBAdapter":
         """Create adapter from connection URL.
 
         Args:
             url: Connection URL (e.g., "duckdb:///:memory:" or "duckdb:///path/to/db.duckdb")
+            init_sql: SQL statements to run after connecting (overrides any init_sql in URL params)
 
         Returns:
             DuckDBAdapter instance
@@ -117,6 +144,7 @@ class DuckDBAdapter(BaseDatabaseAdapter):
         query = parse_qs(parsed.query)
         read_only = False
         config: dict[str, Any] = {}
+        url_init_sql: list[str] | None = None
 
         def parse_value(value: str) -> Any:
             lowered = value.lower()
@@ -132,10 +160,15 @@ class DuckDBAdapter(BaseDatabaseAdapter):
         for key, values in query.items():
             if not values:
                 continue
+            if key == "init_sql":
+                url_init_sql = values
+                continue
             value = values[-1]
             if key == "read_only":
                 read_only = bool(parse_value(value))
             else:
                 config[key] = parse_value(value)
 
-        return cls(db_path, read_only=read_only, config=config or None)
+        # Parameter init_sql overrides any init_sql found in URL query params
+        effective_init_sql = init_sql if init_sql is not None else url_init_sql
+        return cls(db_path, read_only=read_only, config=config or None, init_sql=effective_init_sql)

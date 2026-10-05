@@ -1,10 +1,15 @@
 """Unit tests for BSL adapter and expression parser."""
 
+import ast
+
 import pytest
 
 from sidemantic.adapters.bsl import BSLAdapter
 from sidemantic.adapters.bsl_expr import (
     ParsedExpr,
+    _sql_to_bsl_expr,
+    bsl_calc_to_sql,
+    bsl_filter_to_sql,
     bsl_to_sql,
     is_calc_measure_expr,
     parse_bsl_expr,
@@ -240,6 +245,16 @@ class TestCalcMeasures:
         assert "NULLIF" not in result
         assert "revenue" in result
 
+    def test_bsl_deferred_calc_measure_refs(self):
+        """Test translating current BSL calculated-measure syntax."""
+        assert bsl_calc_to_sql("_.total_a / _.total_b") == "total_a / total_b"
+
+    def test_bsl_all_calc_measure_ref(self):
+        """Test translating BSL _.all() calculated-measure syntax."""
+        assert bsl_calc_to_sql("_.total_distance / _.all(_.total_distance) * 100") == (
+            "(total_distance / __bsl_all(total_distance)) * 100"
+        )
+
 
 class TestBSLAdapterImport:
     """Tests for BSL adapter import functionality."""
@@ -301,33 +316,160 @@ class TestBSLAdapterImport:
         assert "EXTRACT(YEAR FROM" in created_year.sql
 
     def test_import_flights_with_joins(self):
-        """Test importing flights fixture with joins."""
+        """Test importing flights fixture with joins (full 5-model version)."""
         adapter = BSLAdapter()
         graph = adapter.parse("tests/fixtures/bsl/flights.yml")
 
         assert "flights" in graph.models
         assert "carriers" in graph.models
+        assert "aircraft" in graph.models
+        assert "aircraft_models" in graph.models
+        assert "airports" in graph.models
 
         flights = graph.models["flights"]
 
-        # Verify join relationship
-        assert len(flights.relationships) == 1
-        rel = flights.relationships[0]
-        assert rel.name == "carriers"
-        assert rel.type == "many_to_one"
-        assert rel.foreign_key == "carrier"
-        assert rel.primary_key == "code"
+        # Verify join relationships (3 joins: carriers, aircraft, origin_airport)
+        assert len(flights.relationships) == 3
+        rel_names = {r.name for r in flights.relationships}
+        assert "carriers" in rel_names
+        assert "aircraft" in rel_names
+        assert "origin_airport" in rel_names
+        assert "origin_airport" in graph.models
+
+        # Verify carriers join details
+        carriers_rel = next(r for r in flights.relationships if r.name == "carriers")
+        assert carriers_rel.type == "many_to_one"
+        assert carriers_rel.foreign_key == "carrier"
+        assert carriers_rel.primary_key == "code"
+
+        origin_rel = next(r for r in flights.relationships if r.name == "origin_airport")
+        assert origin_rel.metadata["bsl_model"] == "airports"
+        assert origin_rel.foreign_key == "origin"
+        assert origin_rel.primary_key == "code"
+
+        # Verify aircraft has its own join to aircraft_models
+        aircraft = graph.models["aircraft"]
+        assert len(aircraft.relationships) == 1
+        assert aircraft.relationships[0].name == "models"
+        assert aircraft.relationships[0].metadata["bsl_model"] == "aircraft_models"
 
     def test_import_directory(self):
-        """Test importing all files in a directory."""
-        adapter = BSLAdapter()
-        graph = adapter.parse("tests/fixtures/bsl")
+        """Test importing multiple files individually.
 
-        # Should have models from all fixture files
+        Note: directory import can fail with duplicate model names across files
+        (e.g. flights.yml and yaml_example_filter.yaml both define 'flights').
+        Test individual files instead.
+        """
+        adapter = BSLAdapter()
+
+        # Import individual fixtures that have unique model names
+        graph = adapter.parse("tests/fixtures/bsl/orders.yml")
         assert "orders" in graph.models
-        assert "order_items" in graph.models
-        assert "flights" in graph.models
-        assert "carriers" in graph.models
+
+        graph2 = adapter.parse("tests/fixtures/bsl/order_items.yml")
+        assert "order_items" in graph2.models
+
+        graph3 = adapter.parse("tests/fixtures/bsl/flights.yml")
+        assert "flights" in graph3.models
+        assert "carriers" in graph3.models
+        assert "aircraft" in graph3.models
+        assert "airports" in graph3.models
+        assert "aircraft_models" in graph3.models
+
+        graph4 = adapter.parse("tests/fixtures/bsl/ga_sessions.yaml")
+        assert "ga_sessions" in graph4.models
+
+        graph5 = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+        assert "encounters" in graph5.models
+        assert "patients" in graph5.models
+        assert "organizations" in graph5.models
+        assert "payers" in graph5.models
+        assert "conditions" in graph5.models
+        assert "medications" in graph5.models
+
+    def test_bsl_all_count_distinct_uses_global_distinct_denominator(self, tmp_path):
+        """_.all() over count_distinct should not sum grouped distinct counts."""
+        from sidemantic import SemanticLayer
+
+        bsl_file = tmp_path / "events.yml"
+        bsl_file.write_text(
+            """
+events:
+  table: events
+  dimensions:
+    event_id:
+      expr: _.event_id
+      is_entity: true
+    segment: _.segment
+  measures:
+    users: _.user_id.nunique()
+  calculated_measures:
+    user_share: _.users / _.all(_.users)
+"""
+        )
+
+        layer = SemanticLayer(connection="duckdb:///:memory:")
+        layer.graph = BSLAdapter().parse(bsl_file)
+        layer.adapter.execute("CREATE TABLE events (event_id INTEGER, segment VARCHAR, user_id INTEGER)")
+        layer.adapter.execute("INSERT INTO events VALUES (1, 'a', 1), (2, 'b', 1), (3, 'b', 2)")
+
+        result = layer.query(metrics=["events.user_share"], dimensions=["events.segment"])
+        rows = result.fetchall()
+
+        by_segment = {segment: float(user_share) for segment, user_share in rows}
+        assert by_segment["a"] == pytest.approx(0.5)
+        assert by_segment["b"] == pytest.approx(1.0)
+
+    def test_bsl_all_count_distinct_preserves_joined_filters(self, tmp_path):
+        """_.all() over count_distinct should use the joined filtered row set."""
+        from sidemantic import SemanticLayer
+
+        bsl_file = tmp_path / "orders.yml"
+        bsl_file.write_text(
+            """
+orders:
+  table: orders
+  dimensions:
+    order_id:
+      expr: _.order_id
+      is_entity: true
+    customer_id: _.customer_id
+  measures:
+    users: _.user_id.nunique()
+  calculated_measures:
+    user_share: _.users / _.all(_.users)
+  joins:
+    customers:
+      model: customers
+      type: one
+      left_on: customer_id
+      right_on: customer_id
+
+customers:
+  table: customers
+  dimensions:
+    customer_id:
+      expr: _.customer_id
+      is_entity: true
+    region: _.region
+"""
+        )
+
+        layer = SemanticLayer(connection="duckdb:///:memory:")
+        layer.graph = BSLAdapter().parse(bsl_file)
+        layer.adapter.execute("CREATE TABLE orders (order_id INTEGER, customer_id INTEGER, user_id INTEGER)")
+        layer.adapter.execute("INSERT INTO orders VALUES (1, 1, 1), (2, 2, 2), (3, 2, 3), (4, 1, 4)")
+        layer.adapter.execute("CREATE TABLE customers (customer_id INTEGER, region VARCHAR)")
+        layer.adapter.execute("INSERT INTO customers VALUES (1, 'US'), (2, 'EU')")
+
+        result = layer.query(
+            metrics=["orders.user_share"],
+            dimensions=["customers.region"],
+            filters=["customers.region = 'EU'"],
+        )
+        rows = result.fetchall()
+
+        assert [(region, float(user_share)) for region, user_share in rows] == [("EU", pytest.approx(1.0))]
 
 
 class TestBSLAdapterExport:
@@ -440,7 +582,7 @@ class TestBSLAdapterExportDetailed:
             with open(temp_path) as f:
                 data = yaml.safe_load(f)
 
-            measures = data["sales"]["measures"]
+            measures = data["sales"]["calculated_measures"]
 
             # Derived metric should preserve the SQL expression
             avg_order = measures["avg_order_value"]
@@ -787,6 +929,54 @@ test_model:
             model = layer.graph.models["test_model"]
             assert model.table == "test_table"
 
+    def test_auto_detect_bsl_with_model_name_containing_models(self):
+        """BSL detection should not confuse aircraft_models with native models:."""
+        import tempfile
+        from pathlib import Path
+
+        from sidemantic import SemanticLayer
+        from sidemantic.loaders import load_from_directory
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bsl_file = Path(tmpdir) / "flights.yml"
+            bsl_file.write_text("""
+aircraft_models:
+  table: aircraft_models_tbl
+  dimensions:
+    code: _.code
+  measures:
+    model_count: _.count()
+""")
+
+            layer = SemanticLayer()
+            load_from_directory(layer, tmpdir)
+
+            assert "aircraft_models" in layer.graph.models
+
+    def test_auto_detect_bsl_with_measure_name_containing_views(self):
+        """BSL detection should not confuse total_page_views with Cube views:."""
+        import tempfile
+        from pathlib import Path
+
+        from sidemantic import SemanticLayer
+        from sidemantic.loaders import load_from_directory
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bsl_file = Path(tmpdir) / "ga_sessions.yaml"
+            bsl_file.write_text("""
+ga_sessions:
+  table: ga_sample
+  dimensions:
+    visit_id: _.visitId
+  measures:
+    total_page_views: _.totals.pageviews.sum()
+""")
+
+            layer = SemanticLayer()
+            load_from_directory(layer, tmpdir)
+
+            assert "ga_sessions" in layer.graph.models
+
     def test_auto_detect_distinguishes_formats(self):
         """Test that BSL is distinguished from other YAML formats."""
         # BSL uses _.column syntax
@@ -819,6 +1009,955 @@ models:
 
         # Check that BSL pattern doesn't match Sidemantic
         assert not ("_." in sidemantic_content and "dimensions:" in sidemantic_content)
+
+
+class TestBSLCurrentSyntaxSupport:
+    """Tests for current upstream BSL YAML features."""
+
+    def test_deferred_calculated_measure_compiles(self):
+        import tempfile
+        from pathlib import Path
+
+        from sidemantic.sql.generator import SQLGenerator
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write("""
+test:
+  table: events
+  dimensions:
+    category: _.category
+  measures:
+    total_a: _.a.sum()
+    total_b: _.b.sum()
+  calculated_measures:
+    ratio: _.total_a / _.total_b
+""")
+            temp_path = Path(f.name)
+
+        try:
+            graph = BSLAdapter().parse(temp_path)
+            ratio = graph.models["test"].get_metric("ratio")
+            assert ratio.type == "derived"
+            assert ratio.sql == "total_a / total_b"
+
+            sql = SQLGenerator(graph).generate(
+                metrics=["test.ratio"],
+                dimensions=["test.category"],
+                skip_default_time_dimensions=True,
+            )
+            assert "_." not in sql
+            assert "SUM(test_cte.total_a_raw)" in sql
+            assert "SUM(test_cte.total_b_raw)" in sql
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def test_all_calculated_measure_compiles_to_window_total(self):
+        import tempfile
+        from pathlib import Path
+
+        from sidemantic.sql.generator import SQLGenerator
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write("""
+flights:
+  table: flights_tbl
+  dimensions:
+    carrier: _.carrier
+  measures:
+    total_distance: _.distance.sum()
+  calculated_measures:
+    pct_of_total: _.total_distance / _.all(_.total_distance) * 100
+""")
+            temp_path = Path(f.name)
+
+        try:
+            graph = BSLAdapter().parse(temp_path)
+            pct = graph.models["flights"].get_metric("pct_of_total")
+            assert pct.sql == "(total_distance / __bsl_all(total_distance)) * 100"
+
+            sql = SQLGenerator(graph).generate(
+                metrics=["flights.pct_of_total"],
+                dimensions=["flights.carrier"],
+                skip_default_time_dimensions=True,
+            )
+            assert "_.all" not in sql
+            assert "SUM(SUM(flights_cte.total_distance_raw)) OVER ()" in sql
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def test_qualified_calculated_measure_compiles_joined_measure(self):
+        import tempfile
+        from pathlib import Path
+
+        import duckdb
+
+        from sidemantic.sql.generator import SQLGenerator
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write("""
+orders:
+  table: orders
+  dimensions:
+    order_id:
+      expr: _.order_id
+      is_entity: true
+    customer_id: _.customer_id
+  measures:
+    count: _.count()
+  calculated_measures:
+    customer_order_ratio: _.customers.count / _.count
+  joins:
+    customers:
+      model: customers
+      type: one
+      left_on: customer_id
+      right_on: customer_id
+
+customers:
+  table: customers
+  dimensions:
+    customer_id:
+      expr: _.customer_id
+      is_entity: true
+  measures:
+    count: _.count()
+""")
+            temp_path = Path(f.name)
+
+        try:
+            graph = BSLAdapter().parse(temp_path)
+            metric = graph.models["orders"].get_metric("customer_order_ratio")
+            assert metric.sql == "customers.count / count"
+
+            sql = SQLGenerator(graph).generate(
+                metrics=["orders.customer_order_ratio"],
+                dimensions=["orders.customer_id"],
+                order_by=["orders.customer_id"],
+                skip_default_time_dimensions=True,
+            )
+            with duckdb.connect() as connection:
+                connection.execute("create table orders(order_id integer, customer_id integer)")
+                connection.execute("insert into orders values (1, 1), (2, 1), (3, 2)")
+                connection.execute("create table customers(customer_id integer)")
+                connection.execute("insert into customers values (1), (2)")
+                assert connection.execute(sql).fetchall() == [(1, 0.5), (2, 1.0)]
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def test_event_timestamp_derived_dimensions_metadata_and_export(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write("""
+profile:
+  type: duckdb
+  database: ":memory:"
+events:
+  table: events
+  database:
+    - analytics
+    - prod
+  dimensions:
+    occurred_at:
+      expr: _.occurred_at
+      is_event_timestamp: true
+      derived_dimensions: [year, month]
+      metadata:
+        semantic_type: event_time
+  measures:
+    total_revenue:
+      expr: _.revenue.sum()
+      metadata:
+        currency: USD
+  calculated_measures:
+    pct_revenue:
+      expr: _.total_revenue / _.all(_.total_revenue) * 100
+      metadata:
+        unit: percent
+""")
+            temp_path = Path(f.name)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as export_file:
+            export_path = Path(export_file.name)
+
+        try:
+            adapter = BSLAdapter()
+            graph = adapter.parse(temp_path)
+            model = graph.models["events"]
+            assert model.metadata["bsl_profile"] == {"type": "duckdb", "database": ":memory:"}
+            assert model.metadata["bsl_database"] == ["analytics", "prod"]
+
+            occurred_at = model.get_dimension("occurred_at")
+            assert occurred_at.type == "time"
+            assert occurred_at.metadata["bsl_is_event_timestamp"] is True
+            assert occurred_at.metadata["bsl_derived_dimensions"] == ["year", "month"]
+            assert occurred_at.metadata["bsl_metadata"] == {"semantic_type": "event_time"}
+            assert model.get_dimension("occurred_at_year") is not None
+            assert model.get_dimension("occurred_at_month") is not None
+
+            total_revenue = model.get_metric("total_revenue")
+            assert total_revenue.metadata["bsl_metadata"] == {"currency": "USD"}
+
+            adapter.export(graph, export_path)
+            with open(export_path) as f:
+                exported = yaml.safe_load(f)
+
+            event_def = exported["events"]
+            assert exported["profile"] == {"type": "duckdb", "database": ":memory:"}
+            assert event_def["database"] == ["analytics", "prod"]
+            assert "occurred_at_year" not in event_def["dimensions"]
+            occurred_export = event_def["dimensions"]["occurred_at"]
+            assert occurred_export["is_event_timestamp"] is True
+            assert occurred_export["derived_dimensions"] == ["year", "month"]
+            assert occurred_export["metadata"] == {"semantic_type": "event_time"}
+            assert event_def["measures"]["total_revenue"]["metadata"] == {"currency": "USD"}
+            assert event_def["calculated_measures"]["pct_revenue"]["metadata"] == {"unit": "percent"}
+        finally:
+            temp_path.unlink(missing_ok=True)
+            export_path.unlink(missing_ok=True)
+
+    def test_join_aliases_self_join_and_how_roundtrip(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        from sidemantic.sql.generator import SQLGenerator
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write("""
+airports:
+  table: airports
+  dimensions:
+    code: _.code
+    city: _.city
+
+flights:
+  table: flights
+  dimensions:
+    origin: _.origin
+    destination: _.destination
+  measures:
+    flight_count: _.count()
+  joins:
+    origin_airport:
+      model: airports
+      type: one
+      how: inner
+      left_on: origin
+      right_on: code
+    destination_airport:
+      model: airports
+      type: one
+      left_on: destination
+      right_on: code
+""")
+            temp_path = Path(f.name)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as export_file:
+            export_path = Path(export_file.name)
+
+        try:
+            adapter = BSLAdapter()
+            graph = adapter.parse(temp_path)
+            assert "origin_airport" in graph.models
+            assert "destination_airport" in graph.models
+
+            flights = graph.models["flights"]
+            origin_rel = flights.relationships[0]
+            assert origin_rel.name == "origin_airport"
+            assert origin_rel.metadata["bsl_model"] == "airports"
+            assert origin_rel.metadata["bsl_how"] == "inner"
+
+            sql = SQLGenerator(graph).generate(
+                metrics=["flights.flight_count"],
+                dimensions=["origin_airport.city", "destination_airport.city"],
+                skip_default_time_dimensions=True,
+            )
+            assert "origin_airport_cte" in sql
+            assert "destination_airport_cte" in sql
+            assert "INNER JOIN flights_cte" in sql
+            assert "origin_airport_cte.code = flights_cte.origin" in sql
+            assert "flights_cte.destination = destination_airport_cte.code" in sql
+
+            adapter.export(graph, export_path)
+            with open(export_path) as f:
+                exported = yaml.safe_load(f)
+            joins = exported["flights"]["joins"]
+            assert joins["origin_airport"]["model"] == "airports"
+            assert joins["origin_airport"]["how"] == "inner"
+            assert joins["destination_airport"]["model"] == "airports"
+            assert "origin_airport" not in exported
+            assert "destination_airport" not in exported
+        finally:
+            temp_path.unlink(missing_ok=True)
+            export_path.unlink(missing_ok=True)
+
+    def test_reused_join_aliases_scope_to_source_model(self):
+        import tempfile
+        from pathlib import Path
+
+        import duckdb
+        import yaml
+
+        from sidemantic.sql.generator import SQLGenerator
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write("""
+orders:
+  table: orders
+  dimensions:
+    order_id:
+      expr: _.order_id
+      is_entity: true
+    user_id: _.user_id
+  measures:
+    count: _.count()
+  calculated_measures:
+    user_count_ratio: _.user.count / _.count
+  joins:
+    user:
+      model: customers
+      type: one
+      left_on: user_id
+      right_on: customer_id
+
+events:
+  table: events
+  dimensions:
+    event_id:
+      expr: _.event_id
+      is_entity: true
+    account_id: _.account_id
+  measures:
+    count: _.count()
+  calculated_measures:
+    user_count_ratio: _.user.count / _.count
+  joins:
+    user:
+      model: accounts
+      type: one
+      left_on: account_id
+      right_on: account_id
+
+customers:
+  table: customers
+  dimensions:
+    customer_id:
+      expr: _.customer_id
+      is_entity: true
+    name: _.name
+  measures:
+    count: _.count()
+
+accounts:
+  table: accounts
+  dimensions:
+    account_id:
+      expr: _.account_id
+      is_entity: true
+    name: _.name
+  measures:
+    count: _.count()
+""")
+            temp_path = Path(f.name)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as export_file:
+            export_path = Path(export_file.name)
+
+        try:
+            adapter = BSLAdapter()
+            graph = adapter.parse(temp_path)
+
+            assert "user" not in graph.models
+            assert "orders_user" in graph.models
+            assert "events_user" in graph.models
+            assert graph.models["orders_user"].table == "customers"
+            assert graph.models["events_user"].table == "accounts"
+
+            orders_rel = graph.models["orders"].relationships[0]
+            events_rel = graph.models["events"].relationships[0]
+            assert orders_rel.name == "orders_user"
+            assert orders_rel.metadata["bsl_alias"] == "user"
+            assert events_rel.name == "events_user"
+            assert events_rel.metadata["bsl_alias"] == "user"
+
+            orders_metric = graph.models["orders"].get_metric("user_count_ratio")
+            events_metric = graph.models["events"].get_metric("user_count_ratio")
+            assert orders_metric.sql == "orders_user.count / count"
+            assert events_metric.sql == "events_user.count / count"
+
+            orders_sql = SQLGenerator(graph).generate(
+                metrics=["orders.user_count_ratio"],
+                dimensions=["orders.order_id"],
+                skip_default_time_dimensions=True,
+            )
+            assert "orders_user_cte" in orders_sql
+            assert "events_user_cte" not in orders_sql
+            assert "FROM customers" in orders_sql
+
+            events_sql = SQLGenerator(graph).generate(
+                metrics=["events.user_count_ratio"],
+                dimensions=["events.event_id"],
+                skip_default_time_dimensions=True,
+            )
+            assert "events_user_cte" in events_sql
+            assert "orders_user_cte" not in events_sql
+            assert "FROM accounts" in events_sql
+
+            with duckdb.connect() as conn:
+                conn.execute("CREATE TABLE orders (order_id INTEGER, user_id INTEGER)")
+                conn.execute("INSERT INTO orders VALUES (1, 10), (2, 10)")
+                conn.execute("CREATE TABLE customers (customer_id INTEGER, name VARCHAR)")
+                conn.execute("INSERT INTO customers VALUES (10, 'customer')")
+                conn.execute("CREATE TABLE events (event_id INTEGER, account_id INTEGER)")
+                conn.execute("INSERT INTO events VALUES (3, 20)")
+                conn.execute("CREATE TABLE accounts (account_id INTEGER, name VARCHAR)")
+                conn.execute("INSERT INTO accounts VALUES (20, 'account')")
+                assert sorted(conn.execute(orders_sql).fetchall()) == [(1, 1.0), (2, 1.0)]
+                assert conn.execute(events_sql).fetchall() == [(3, 1.0)]
+
+            adapter.export(graph, export_path)
+            with open(export_path) as f:
+                exported = yaml.safe_load(f)
+            assert exported["orders"]["joins"]["user"]["model"] == "customers"
+            assert exported["events"]["joins"]["user"]["model"] == "accounts"
+            assert "orders_user" not in exported
+            assert "events_user" not in exported
+        finally:
+            temp_path.unlink(missing_ok=True)
+            export_path.unlink(missing_ok=True)
+
+    def test_cross_join_compiles(self):
+        import tempfile
+        from pathlib import Path
+
+        import duckdb
+
+        from sidemantic.sql.generator import SQLGenerator
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write("""
+calendar:
+  table: calendar
+  dimensions:
+    day: _.day
+
+facts:
+  table: facts
+  dimensions:
+    id: _.id
+  measures:
+    fact_count: _.count()
+  joins:
+    calendar:
+      model: calendar
+      type: cross
+""")
+            temp_path = Path(f.name)
+
+        try:
+            graph = BSLAdapter().parse(temp_path)
+            rel = graph.models["facts"].relationships[0]
+            assert rel.type == "cross"
+            sql = SQLGenerator(graph).generate(
+                metrics=["facts.fact_count"],
+                dimensions=["calendar.day"],
+                skip_default_time_dimensions=True,
+            )
+            assert "CROSS JOIN facts_cte" in sql
+            assert "id AS id" in sql
+
+            conn = duckdb.connect(":memory:")
+            conn.execute("CREATE TABLE calendar(day DATE)")
+            conn.execute("INSERT INTO calendar VALUES (DATE '2024-01-01')")
+            conn.execute("CREATE TABLE facts(id INTEGER)")
+            conn.execute("INSERT INTO facts VALUES (1)")
+            assert len(conn.execute(sql).fetchall()) == 1
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+
+class TestBSLCompoundExpressions:
+    """Tests for compound arithmetic expressions like (_.a - _.b).sum()."""
+
+    def test_parse_arithmetic_subtraction(self):
+        result = parse_bsl_expr("(_.total_claim_cost - _.payer_coverage).sum()")
+        assert result.column == "total_claim_cost - payer_coverage"
+        assert result.aggregation == "sum"
+
+    def test_parse_arithmetic_addition(self):
+        result = parse_bsl_expr("(_.a + _.b).sum()")
+        assert result.column == "a + b"
+        assert result.aggregation == "sum"
+
+    def test_parse_arithmetic_division(self):
+        result = parse_bsl_expr("(_.a / _.b).mean()")
+        assert result.column == "a / b"
+        assert result.aggregation == "mean"
+
+    def test_parse_arithmetic_multiplication(self):
+        result = parse_bsl_expr("(_.a * _.b).sum()")
+        assert result.column == "a * b"
+        assert result.aggregation == "sum"
+
+    def test_parse_arithmetic_with_constant(self):
+        result = parse_bsl_expr("(_.a * 100).sum()")
+        assert result.column == "a * 100"
+        assert result.aggregation == "sum"
+
+    def test_parse_nested_arithmetic_preserves_grouping(self):
+        result = parse_bsl_expr("(_.a - (_.b + _.c)).sum()")
+        assert result.column == "a - (b + c)"
+        assert result.aggregation == "sum"
+
+    def test_parse_nested_arithmetic_left_grouping(self):
+        result = parse_bsl_expr("((_.a - _.b) * _.c).sum()")
+        assert result.column == "(a - b) * c"
+        assert result.aggregation == "sum"
+
+    def test_bsl_to_sql_compound(self):
+        sql, agg, date_part = bsl_to_sql("(_.total_claim_cost - _.payer_coverage).sum()")
+        assert sql == "total_claim_cost - payer_coverage"
+        assert agg == "sum"
+        assert date_part is None
+
+    def test_sql_to_bsl_expr_compound(self):
+        result = _sql_to_bsl_expr("total_claim_cost - payer_coverage", "sum")
+        assert result == "(_.total_claim_cost - _.payer_coverage).sum()"
+
+    def test_sql_to_bsl_expr_compound_mean(self):
+        result = _sql_to_bsl_expr("total_claim_cost - payer_coverage", "avg")
+        assert result == "(_.total_claim_cost - _.payer_coverage).mean()"
+
+    def test_sql_to_bsl_expr_recursively_qualifies_function_arguments(self):
+        assert _sql_to_bsl_expr("COALESCE(a, 0) - b", "sum") == "(COALESCE(_.a, 0) - _.b).sum()"
+
+    def test_sql_to_bsl_expr_recursively_qualifies_parenthesized_operands(self):
+        assert _sql_to_bsl_expr("(a + b) / c", "sum") == "((_.a + _.b) / _.c).sum()"
+
+    def test_sql_to_bsl_expr_recursively_qualifies_case_columns(self):
+        result = _sql_to_bsl_expr("CASE WHEN status = 'paid' THEN amount ELSE 0 END", "sum")
+        assert result == ("((_.amount if _.status == 'paid' else 0)).sum()")
+        ast.parse(result, mode="eval")
+        assert bsl_to_sql(result) == ("CASE WHEN status = 'paid' THEN amount ELSE 0 END", "sum", None)
+
+    def test_sql_to_bsl_expr_preserves_simple_case_operand(self):
+        result = _sql_to_bsl_expr("CASE status WHEN 'paid' THEN amount ELSE 0 END", "sum")
+        assert result == ("((_.amount if _.status == 'paid' else 0)).sum()")
+        ast.parse(result, mode="eval")
+        assert bsl_to_sql(result) == ("CASE WHEN status = 'paid' THEN amount ELSE 0 END", "sum", None)
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            ("a IS NULL", "(_.a.isnull()).sum()"),
+            ("a BETWEEN 1 AND b", "(_.a.between(1, _.b)).sum()"),
+            ("a IN (1, b)", "(_.a.isin([1, _.b])).sum()"),
+            ("a LIKE 'x%'", "(_.a.like('x%')).sum()"),
+            ("a IS NOT NULL", "(_.a.notnull()).sum()"),
+            ("EXTRACT(YEAR FROM created_at)", "(_.created_at.year()).sum()"),
+            ("a || b", "(CONCAT(_.a, _.b)).sum()"),
+            ("CAST(a AS INT)", "(CAST(_.a, 'INT')).sum()"),
+            ("-a", "(-_.a).sum()"),
+            ("COALESCE(a, NULL)", "(COALESCE(_.a, None)).sum()"),
+            ("a IS TRUE", "(IS(_.a, True)).sum()"),
+        ],
+    )
+    def test_sql_to_bsl_expr_predicates_are_qualified_and_valid(self, sql, expected):
+        result = _sql_to_bsl_expr(sql, "sum")
+        assert result == expected
+        ast.parse(result, mode="eval")
+        roundtrip_sql, roundtrip_agg, _ = bsl_to_sql(result)
+        assert roundtrip_sql is not None
+        assert roundtrip_agg == "sum"
+
+    @pytest.mark.parametrize(
+        ("sql", "expected", "roundtrip"),
+        [
+            ('"class"', "getattr(_, 'class').sum()", '"class"'),
+            ('"order amount"', "getattr(_, 'order amount').sum()", '"order amount"'),
+            ("`class`", "getattr(_, 'class').sum()", '"class"'),
+            ("[class]", "getattr(_, 'class').sum()", '"class"'),
+        ],
+    )
+    def test_sql_to_bsl_expr_uses_valid_python_for_quoted_or_keyword_columns(self, sql, expected, roundtrip):
+        result = _sql_to_bsl_expr(sql, "sum")
+        assert result == expected
+        ast.parse(result, mode="eval")
+        assert bsl_to_sql(result) == (roundtrip, "sum", None)
+
+
+class TestBSLBooleanExpressions:
+    """Tests for boolean comparison expressions like (_.col == "val").sum()."""
+
+    def test_parse_equality_string(self):
+        result = parse_bsl_expr('(_.encounter_class == "emergency").sum()')
+        assert result.column == "encounter_class = 'emergency'"
+        assert result.aggregation == "sum"
+
+    def test_parse_equality_char(self):
+        result = parse_bsl_expr("(_.shared_match_flag == 'Y').mean()")
+        assert result.column == "shared_match_flag = 'Y'"
+        assert result.aggregation == "mean"
+
+    def test_parse_inequality(self):
+        result = parse_bsl_expr('(_.col != "val").sum()')
+        assert result.column == "col != 'val'"
+        assert result.aggregation == "sum"
+
+    def test_parse_greater_than(self):
+        result = parse_bsl_expr("(_.col > 5).sum()")
+        assert result.column == "col > 5"
+        assert result.aggregation == "sum"
+
+    def test_bsl_to_sql_comparison(self):
+        sql, agg, date_part = bsl_to_sql('(_.encounter_class == "emergency").sum()')
+        assert sql == "encounter_class = 'emergency'"
+        assert agg == "sum"
+        assert date_part is None
+
+    def test_sql_to_bsl_expr_comparison(self):
+        result = _sql_to_bsl_expr("encounter_class = 'emergency'", "sum")
+        assert result == "(_.encounter_class == 'emergency').sum()"
+
+    def test_sql_to_bsl_expr_comparison_mean(self):
+        result = _sql_to_bsl_expr("shared_match_flag = 'Y'", "avg")
+        assert result == "(_.shared_match_flag == 'Y').mean()"
+
+    def test_sql_to_bsl_expr_gte(self):
+        result = _sql_to_bsl_expr("a >= 5", "sum")
+        assert result == "(_.a >= 5).sum()"
+
+
+class TestBSLAdapterHealthcare:
+    """Tests for healthcare fixture (compound measures, with: joins, primary_key)."""
+
+    def test_import_healthcare_compound_measures(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+        encounters = graph.models["encounters"]
+
+        total_oop = next(m for m in encounters.metrics if m.name == "total_out_of_pocket")
+        assert total_oop.agg == "sum"
+        assert total_oop.sql == "total_claim_cost - payer_coverage"
+
+        avg_oop = next(m for m in encounters.metrics if m.name == "avg_out_of_pocket")
+        assert avg_oop.agg == "avg"
+        assert avg_oop.sql == "total_claim_cost - payer_coverage"
+
+    def test_import_healthcare_boolean_measures(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+        encounters = graph.models["encounters"]
+
+        emergency = next(m for m in encounters.metrics if m.name == "emergency_count")
+        assert emergency.agg == "sum"
+        assert "encounter_class" in emergency.sql
+        assert "'emergency'" in emergency.sql
+
+        wellness = next(m for m in encounters.metrics if m.name == "wellness_count")
+        assert wellness.agg == "sum"
+        assert "'wellness'" in wellness.sql
+
+    def test_import_healthcare_with_joins(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+        encounters = graph.models["encounters"]
+
+        patient_rel = next(r for r in encounters.relationships if r.name == "patient")
+        assert patient_rel.foreign_key == "patient_id"
+        assert patient_rel.type == "many_to_one"
+
+        org_rel = next(r for r in encounters.relationships if r.name == "organization")
+        assert org_rel.foreign_key == "organization_id"
+
+        payer_rel = next(r for r in encounters.relationships if r.name == "payer")
+        assert payer_rel.foreign_key == "payer_id"
+
+    def test_import_healthcare_primary_key(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+        orgs = graph.models["organizations"]
+        assert orgs.primary_key == "id"
+
+
+class TestBSLAdapterNycTaxi:
+    """Tests for NYC taxi fixture (time_dimension, boolean rates, with: joins)."""
+
+    def test_import_time_dimension(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/nyc_taxi.yml")
+        trips = graph.models["fhvhv_trips"]
+
+        assert trips.default_time_dimension == "pickup_datetime"
+        assert trips.default_grain == "second"
+
+        pickup_dim = next(d for d in trips.dimensions if d.name == "pickup_datetime")
+        assert pickup_dim.type == "time"
+        assert pickup_dim.granularity == "second"
+
+    def test_import_boolean_rate(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/nyc_taxi.yml")
+        trips = graph.models["fhvhv_trips"]
+
+        shared_rate = next(m for m in trips.metrics if m.name == "shared_trip_rate")
+        assert shared_rate.agg == "avg"
+        assert "shared_match_flag" in shared_rate.sql
+        assert "'Y'" in shared_rate.sql
+
+    def test_import_with_join(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/nyc_taxi.yml")
+        trips = graph.models["fhvhv_trips"]
+
+        pickup_rel = next(r for r in trips.relationships if r.name == "pickup_zone")
+        assert pickup_rel.foreign_key == "PULocationID"
+
+
+class TestBSLAdapterFilter:
+    """Tests for model-level filter parsing."""
+
+    def test_import_filter_model(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/yaml_example_filter.yaml")
+        flights = graph.models["flights"]
+
+        # Filter stored in metadata for roundtrip
+        assert flights.metadata is not None
+        assert "bsl_filter" in flights.metadata
+        assert "year" in flights.metadata["bsl_filter"]
+
+        # Filter baked into model.sql as subquery; table kept for migrator
+        assert flights.sql is not None
+        assert "WHERE" in flights.sql
+        assert "year > 2020" in flights.sql
+        assert flights.table == "flights_tbl"
+
+    def test_filter_preserved_in_cross_format_export(self):
+        """Filtered BSL model preserves filter when exported to Cube."""
+        from sidemantic.adapters.cube import CubeAdapter
+
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/yaml_example_filter.yaml")
+
+        cube_adapter = CubeAdapter()
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            temp_path = Path(f.name)
+
+        try:
+            cube_adapter.export(graph, temp_path)
+            import yaml
+
+            with open(temp_path) as f:
+                data = yaml.safe_load(f)
+
+            # The filtered model should export with sql (not sql_table)
+            # so the filter is preserved
+            flights_cube = next(c for c in data["cubes"] if c["name"] == "flights")
+            assert "sql" in flights_cube
+            assert "year > 2020" in flights_cube["sql"]
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+
+class TestBSLFilterToSQL:
+    """Tests for BSL filter expression to SQL conversion."""
+
+    def test_simple_comparison(self):
+        assert bsl_filter_to_sql("_.year > 2020") == "year > 2020"
+
+    def test_equality_string(self):
+        result = bsl_filter_to_sql("_.origin == 'LAX'")
+        assert result == "origin = 'LAX'"
+
+    def test_compound_and(self):
+        result = bsl_filter_to_sql("(_.year > 2020) & (_.origin == 'LAX')")
+        assert result == "(year > 2020) AND (origin = 'LAX')"
+
+    def test_compound_or(self):
+        result = bsl_filter_to_sql("(_.origin == 'LAX') | (_.origin == 'SFO')")
+        assert result == "(origin = 'LAX') OR (origin = 'SFO')"
+
+    def test_mixed_precedence(self):
+        """Parens must preserve precedence in mixed AND/OR filters."""
+        result = bsl_filter_to_sql("(_.a == 1) & ((_.b == 2) | (_.c == 3))")
+        assert "AND" in result
+        assert "OR" in result
+        # The OR clause must be parenthesized to prevent SQL precedence issues
+        assert "(b = 2) OR (c = 3)" in result
+
+    def test_negation(self):
+        result = bsl_filter_to_sql("~(_.origin == 'LAX')")
+        assert result == "NOT (origin = 'LAX')"
+
+    def test_negation_compound(self):
+        result = bsl_filter_to_sql("(_.year > 2020) & ~(_.origin == 'LAX')")
+        assert "AND" in result
+        assert "NOT (origin = 'LAX')" in result
+
+    def test_isin(self):
+        result = bsl_filter_to_sql("_.origin.isin(['LAX', 'SFO', 'JFK'])")
+        assert result == "origin IN ('LAX', 'SFO', 'JFK')"
+
+    def test_notin(self):
+        result = bsl_filter_to_sql("_.status.notin(['cancelled', 'delayed'])")
+        assert result == "status NOT IN ('cancelled', 'delayed')"
+
+    def test_isin_numeric(self):
+        result = bsl_filter_to_sql("_.year.isin([2020, 2021, 2022])")
+        assert result == "year IN (2020, 2021, 2022)"
+
+    def test_between(self):
+        result = bsl_filter_to_sql("_.year.between(2020, 2025)")
+        assert result == "year BETWEEN 2020 AND 2025"
+
+    def test_isnull(self):
+        result = bsl_filter_to_sql("_.origin.isnull()")
+        assert result == "origin IS NULL"
+
+    def test_notnull(self):
+        result = bsl_filter_to_sql("_.origin.notnull()")
+        assert result == "origin IS NOT NULL"
+
+    def test_negative_number(self):
+        assert bsl_filter_to_sql("_.delta > -5") == "delta > -5"
+
+    def test_negative_float(self):
+        assert bsl_filter_to_sql("_.score < -0.5") == "score < -0.5"
+
+
+class TestBSLFilterAutoApply:
+    """Tests that model-level filters are auto-applied in queries via model.sql."""
+
+    def test_filter_applied_in_query(self):
+        from sidemantic import SemanticLayer
+
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/yaml_example_filter.yaml")
+
+        layer = SemanticLayer()
+        layer.graph = graph
+
+        sql = layer.compile(metrics=["flights.flight_count"])
+        # The model-level filter is baked into the FROM subquery
+        assert "year > 2020" in sql
+
+
+class TestBSLRoundtripFidelity:
+    """Tests that BSL import/export preserves original expressions."""
+
+    def test_compound_measure_preserves_original(self):
+        """Compound expressions roundtrip via stored original, not reconstruction."""
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+
+        encounters = graph.models["encounters"]
+        total_oop = next(m for m in encounters.metrics if m.name == "total_out_of_pocket")
+
+        # Original BSL expression is stored
+        assert total_oop.metadata is not None
+        assert total_oop.metadata["bsl_expr"] == "(_.total_claim_cost - _.payer_coverage).sum()"
+
+    def test_boolean_measure_preserves_original(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+
+        encounters = graph.models["encounters"]
+        emergency = next(m for m in encounters.metrics if m.name == "emergency_count")
+
+        assert emergency.metadata is not None
+        assert emergency.metadata["bsl_expr"] == '(_.encounter_class == "emergency").sum()'
+
+    def test_dimension_preserves_original(self):
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/flights.yml")
+
+        flights = graph.models["flights"]
+        origin = next(d for d in flights.dimensions if d.name == "origin")
+
+        assert origin.metadata is not None
+        assert origin.metadata["bsl_expr"] == "_.origin"
+
+    def test_export_uses_stored_original(self):
+        """Export emits the stored BSL expression, not a reconstruction."""
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        adapter = BSLAdapter()
+        graph = adapter.parse("tests/fixtures/bsl/healthcare.yml")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            temp_path = Path(f.name)
+
+        try:
+            adapter.export(graph, temp_path)
+            with open(temp_path) as f:
+                data = yaml.safe_load(f)
+
+            measures = data["encounters"]["measures"]
+
+            # Compound measure exported with original BSL expression
+            total_oop = measures["total_out_of_pocket"]
+            if isinstance(total_oop, str):
+                assert total_oop == "(_.total_claim_cost - _.payer_coverage).sum()"
+            else:
+                assert total_oop["expr"] == "(_.total_claim_cost - _.payer_coverage).sum()"
+
+            # Boolean measure exported with original BSL expression
+            emergency = measures["emergency_count"]
+            if isinstance(emergency, str):
+                assert emergency == '(_.encounter_class == "emergency").sum()'
+            else:
+                assert emergency["expr"] == '(_.encounter_class == "emergency").sum()'
+
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def test_count_metric_exports_correctly(self):
+        """COUNT(*) metrics without sql should export as _.count(), not _.name.count()."""
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        from sidemantic.core.metric import Metric
+        from sidemantic.core.model import Model
+        from sidemantic.core.semantic_graph import SemanticGraph
+
+        model = Model(
+            name="test",
+            table="test",
+            primary_key="id",
+            metrics=[Metric(name="row_count", agg="count")],
+        )
+
+        graph = SemanticGraph()
+        graph.add_model(model)
+        adapter = BSLAdapter()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            temp_path = Path(f.name)
+
+        try:
+            adapter.export(graph, temp_path)
+            with open(temp_path) as f:
+                data = yaml.safe_load(f)
+
+            measure = data["test"]["measures"]["row_count"]
+            expr = measure if isinstance(measure, str) else measure["expr"]
+            assert expr == "_.count()"
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

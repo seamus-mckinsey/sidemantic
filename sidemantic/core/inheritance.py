@@ -3,6 +3,7 @@
 from sidemantic.core.dimension import Dimension
 from sidemantic.core.metric import Metric
 from sidemantic.core.model import Model
+from sidemantic.core.pre_aggregation import Index, PreAggregation, RefreshKey
 from sidemantic.core.relationship import Relationship
 from sidemantic.core.segment import Segment
 
@@ -27,12 +28,23 @@ def merge_model(child: Model, parent: Model) -> Model:
     # Start with parent's data
     merged_data = parent.model_dump(exclude={"name"})
 
-    # Override with child's data (excluding None values and extends)
-    child_data = child.model_dump(exclude_none=True, exclude={"extends"})
+    # Override with child's explicitly set data (excluding extends).
+    # Using include=model_fields_set instead of exclude_none so that
+    # a child can explicitly set a field to None to clear a parent value.
+    child_fields = child.model_fields_set - {"extends"}
+    child_data = child.model_dump(include=child_fields, exclude_unset=True)
+
+    # Invariant filters are refinements, not an overrideable named collection.
+    # A child may narrow its parent further, but cannot silently remove the
+    # parent's row scope.
+    merged_data["invariant_filters"] = [
+        *merged_data.get("invariant_filters", []),
+        *child_data.get("invariant_filters", []),
+    ]
 
     # Merge lists (dimensions, metrics, relationships, segments)
     # Child's items are added to parent's items
-    for field in ["dimensions", "metrics", "relationships", "segments"]:
+    for field in ["dimensions", "metrics", "relationships", "segments", "pre_aggregations"]:
         parent_items = merged_data.get(field, [])
         child_items = child_data.get(field, [])
 
@@ -45,7 +57,21 @@ def merge_model(child: Model, parent: Model) -> Model:
         merged_data[field] = list(parent_by_name.values())
 
     # Override scalar fields with child values
-    for field in ["table", "sql", "description", "primary_key"]:
+    for field in [
+        "table",
+        "sql",
+        "source_uri",
+        "description",
+        "primary_key",
+        "unique_keys",
+        "default_time_dimension",
+        "default_grain",
+        "freshness",
+        "metadata",
+        "auto_dimensions",
+        "schema_exposure",
+        "meta",
+    ]:
         if field in child_data:
             merged_data[field] = child_data[field]
 
@@ -61,6 +87,15 @@ def merge_model(child: Model, parent: Model) -> Model:
         merged_data["relationships"] = [Relationship(**r) for r in merged_data["relationships"]]
     if merged_data.get("segments"):
         merged_data["segments"] = [Segment(**s) for s in merged_data["segments"]]
+    if merged_data.get("pre_aggregations"):
+        preaggs = []
+        for pa in merged_data["pre_aggregations"]:
+            if pa.get("refresh_key") and isinstance(pa["refresh_key"], dict):
+                pa["refresh_key"] = RefreshKey(**pa["refresh_key"])
+            if pa.get("indexes") and isinstance(pa["indexes"], list):
+                pa["indexes"] = [Index(**idx) if isinstance(idx, dict) else idx for idx in pa["indexes"]]
+            preaggs.append(PreAggregation(**pa))
+        merged_data["pre_aggregations"] = preaggs
 
     return Model(**merged_data)
 
@@ -85,8 +120,9 @@ def merge_metric(child: Metric, parent: Metric) -> Metric:
     # Start with parent's data
     merged_data = parent.model_dump(exclude={"name"})
 
-    # Override with child's data (excluding None values and extends)
-    child_data = child.model_dump(exclude_none=True, exclude={"extends"})
+    # Override with child's explicitly set data (excluding extends).
+    child_fields = child.model_fields_set - {"extends"}
+    child_data = child.model_dump(include=child_fields, exclude_unset=True)
 
     # Handle list fields - merge arrays
     for field in ["filters", "drill_fields"]:
@@ -204,3 +240,12 @@ def resolve_metric_inheritance(metrics: dict[str, Metric]) -> dict[str, Metric]:
         resolve(name)
 
     return resolved
+
+
+def resolve_model_metric_inheritance(model: Model) -> None:
+    """Resolve inheritance between metrics declared on a single model."""
+    if not any(metric.extends for metric in model.metrics):
+        return
+
+    resolved_metrics = resolve_metric_inheritance({metric.name: metric for metric in model.metrics})
+    model.metrics = list(resolved_metrics.values())

@@ -6,29 +6,69 @@ on:
       bump:
         description: 'Version bump type'
         required: true
+        default: patch
         type: choice
         options:
           - patch
           - minor
           - major
+      release_tag:
+        description: 'Existing version tag to publish without creating a new version'
+        required: false
+        type: string
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      new_version: ${{ steps.version.outputs.new_version }}
     permissions:
-      id-token: write
       contents: write
 
     steps:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
 
       - name: Set up Python
         run: uv python install 3.12
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Check core import without DAX extra
+        run: |
+          uv run python - <<'PY'
+          import sys
+
+          from sidemantic import Dimension, Metric, Model
+
+          assert Model.__name__ == "Model"
+          assert Dimension.__name__ == "Dimension"
+          assert Metric.__name__ == "Metric"
+          assert "sidemantic_dax" not in sys.modules
+          PY
+
+      - name: Install DAX dependencies
+        run: uv sync --extra dev --extra dax
+
+      - name: Install browser test runtime
+        run: uv run python -m playwright install --with-deps chromium
 
       - name: Get current version
         id: get_version
@@ -38,60 +78,280 @@ jobs:
 
       - name: Calculate new version
         id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           CURRENT="${{ steps.get_version.outputs.current_version }}"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            NEW_VERSION="${RELEASE_TAG#v}"
+            if [[ "v$NEW_VERSION" != "$RELEASE_TAG" || "$CURRENT" != "$NEW_VERSION" ]]; then
+              echo "Release tag $RELEASE_TAG does not match source version $CURRENT" >&2
+              exit 1
+            fi
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
 
-          case "${{ inputs.bump }}" in
-            major)
-              MAJOR=$((MAJOR + 1))
-              MINOR=0
-              PATCH=0
-              ;;
-            minor)
-              MINOR=$((MINOR + 1))
-              PATCH=0
-              ;;
-            patch)
-              PATCH=$((PATCH + 1))
-              ;;
-          esac
+            case "$BUMP" in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                ;;
+            esac
 
-          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          fi
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "VERSION=$NEW_VERSION" >> $GITHUB_ENV
 
-      - name: Update version in pyproject.toml and __init__.py
-        run: |
-          sed -i 's/^version = .*/version = "${{ steps.version.outputs.new_version }}"/' pyproject.toml
-          sed -i 's/^__version__ = .*/__version__ = "${{ steps.version.outputs.new_version }}"/' sidemantic/__init__.py
-          echo "Updated version to ${{ steps.version.outputs.new_version }}"
-
-      - name: Update lock file
-        run: uv lock
-
-      - name: Build package
-        run: uv build
-
-      - name: Publish to PyPI
+      - name: Update version in pyproject.toml, DAX package, and __init__.py
+        if: ${{ inputs.release_tag == '' }}
         env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: uv publish --token $UV_PUBLISH_TOKEN
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: |
+          uv run --no-project python - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["NEW_VERSION"]
+
+          version_files = (
+              Path("pyproject.toml"),
+              Path("crates/dax-pyo3/pyproject.toml"),
+              Path("sidemantic-rs/pyproject.toml"),
+              Path("crates/dax-pyo3/Cargo.toml"),
+          )
+          for path in version_files:
+              lines = path.read_text().splitlines()
+              path.write_text(
+                  "\n".join(
+                      f'version = "{version}"' if line.startswith("version = ") else line
+                      for line in lines
+                  )
+                  + "\n"
+              )
+
+          init_path = Path("sidemantic/__init__.py")
+          init_lines = init_path.read_text().splitlines()
+          init_path.write_text(
+              "\n".join(
+                  f'__version__ = "{version}"' if line.startswith("__version__ = ") else line
+                  for line in init_lines
+              )
+              + "\n"
+          )
+
+          pyproject_path = Path("pyproject.toml")
+          pyproject_lines = pyproject_path.read_text().splitlines()
+          pyproject_path.write_text(
+              "\n".join(
+                  f'    "sidemantic-dax>={version}",' if line.strip().startswith('"sidemantic-dax>=')
+                  else f'    "sidemantic-rs=={version}; sys_platform != \'emscripten\'",' if line.strip().startswith('"sidemantic-rs==')
+                  else line
+                  for line in pyproject_lines
+              )
+              + "\n"
+          )
+          PY
+          echo "Updated version to $NEW_VERSION"
+
+      - name: Update lock files
+        if: ${{ inputs.release_tag == '' }}
+        run: |
+          cargo generate-lockfile
+          uv lock
+          uv run python scripts/generate_man_page.py
+
+      - name: Validate release tree
+        run: |
+          uv run ruff check . --exclude docs/_extensions --exclude sidemantic-duckdb/extension-ci-tools --exclude sidemantic-duckdb/scripts --exclude sidemantic-duckdb/duckdb --exclude sidemantic/adapters/malloy_grammar --exclude sidemantic/adapters/holistics_grammar
+          uv run ruff format --check . --exclude docs/_extensions --exclude sidemantic-duckdb/extension-ci-tools --exclude sidemantic-duckdb/scripts --exclude sidemantic-duckdb/duckdb --exclude sidemantic/adapters/malloy_grammar --exclude sidemantic/adapters/holistics_grammar
+          uv run mypy
+          uv run mypy --config-file tests/typing/mypy.ini tests/typing/package_consumer.py
+          uv run pytest -v --cov-fail-under=76
+          uv run python scripts/build_widget.py --check
+          uv run python scripts/build_webapp.py --check
+          uv run python scripts/build_ui_distribution.py --check
+
+      - name: Build packages
+        run: |
+          uv build sidemantic-rs --sdist --out-dir dist
+          uv build crates/dax-pyo3 --sdist --out-dir dist
+          uv build --out-dir dist
+          unzip -l "$(find dist -name 'sidemantic-[0-9]*.whl' -print -quit)" | grep -q 'sidemantic/py.typed'
+
+      - name: Run installed-wheel DAX smoke
+        run: |
+          DIST_DIR=$(realpath dist)
+          SIDEMANTIC_WHEEL=$(realpath "$(find dist -name 'sidemantic-[0-9]*.whl' -print -quit)")
+          cd /tmp
+          uv run --no-project --find-links "${DIST_DIR}" --with "${SIDEMANTIC_WHEEL}[dax]" -- python - <<'PY'
+          import sidemantic_dax
+
+          sidemantic_dax.parse_expression("1")
+          PY
 
       - name: Commit version bump and create tag
+        if: ${{ inputs.release_tag == '' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml sidemantic/__init__.py uv.lock
+          git add pyproject.toml sidemantic/__init__.py sidemantic/man/sidemantic.1 sidemantic-rs/pyproject.toml crates/dax-pyo3/pyproject.toml crates/dax-pyo3/Cargo.toml Cargo.lock uv.lock
           git commit -m "Bump version to ${{ steps.version.outputs.new_version }}"
           git tag -a "v${{ steps.version.outputs.new_version }}" -m "Release v${{ steps.version.outputs.new_version }}"
           git push origin main
           git push origin "v${{ steps.version.outputs.new_version }}"
 
+      - name: Upload sdist and sidemantic wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-base
+          path: dist/*
+          if-no-files-found: error
+
+  build-dax-wheels:
+    name: Build sidemantic-dax wheel (${{ matrix.target }})
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-latest
+            target: aarch64
+          - os: macos-15-intel
+            target: x86_64
+          - os: macos-14
+            target: aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.publish.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path crates/dax-pyo3/Cargo.toml --out crates/dax-pyo3/dist
+          manylinux: auto
+          target: ${{ matrix.target }}
+
+      - name: Upload abi3 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-dax-${{ matrix.os }}-${{ matrix.target }}
+          path: crates/dax-pyo3/dist/*.whl
+          if-no-files-found: error
+
+  build-runtime-wheels:
+    name: Build sidemantic-rs wheel (${{ matrix.target }})
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64
+          - os: macos-15-intel
+            target: x86_64
+          - os: macos-14
+            target: aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.publish.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path sidemantic-rs/Cargo.toml --out sidemantic-rs/dist
+          manylinux: auto
+          target: ${{ matrix.target }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+
+      - name: Smoke runtime wheel
+        shell: bash
+        run: uv run --no-project --with sidemantic-rs/dist/*.whl sidemantic-rs/tests/python_wheel_python_smoke.py
+
+      - name: Upload abi3 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-runtime-${{ matrix.os }}-${{ matrix.target }}
+          path: sidemantic-rs/dist/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Publish to PyPI and create release
+    needs:
+      - publish
+      - build-dax-wheels
+      - build-runtime-wheels
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          uv publish dist/sidemantic_rs-* --token "$UV_PUBLISH_TOKEN"
+          uv publish dist/sidemantic_dax-* --token "$UV_PUBLISH_TOKEN"
+          uv publish dist/sidemantic-[0-9]* --token "$UV_PUBLISH_TOKEN"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "v${{ steps.version.outputs.new_version }}" \
-            --title "v${{ steps.version.outputs.new_version }}" \
+          gh release create "${{ needs.publish.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ needs.publish.outputs.tag }}" \
             --generate-notes

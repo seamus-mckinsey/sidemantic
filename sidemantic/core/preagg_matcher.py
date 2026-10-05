@@ -1,8 +1,11 @@
 """Pre-aggregation query matching logic."""
 
+from __future__ import annotations
+
 from sidemantic.core.metric import Metric
 from sidemantic.core.model import Model
 from sidemantic.core.pre_aggregation import PreAggregation
+from sidemantic.core.query_plan import PreaggCandidate, PreaggCheck
 
 # Time granularity hierarchy (coarser to finer)
 GRANULARITY_HIERARCHY = {
@@ -12,6 +15,8 @@ GRANULARITY_HIERARCHY = {
     "week": 4,
     "day": 5,
     "hour": 6,
+    "minute": 7,
+    "second": 8,
 }
 
 
@@ -104,6 +109,11 @@ class PreAggregationMatcher:
         Returns:
             True if pre-aggregation can satisfy the query
         """
+        # original_sql pre-aggregations stage a base query, not an aggregation
+        # rollup, so they never directly satisfy a metric query.
+        if preagg.type == "original_sql":
+            return False
+
         # 1. Check dimension subset
         # Query dimensions must be subset of pre-agg dimensions
         preagg_dims = set(preagg.dimensions or [])
@@ -123,6 +133,13 @@ class PreAggregationMatcher:
             if not metric:
                 return False
 
+            if metric.agg in ("count_distinct", "approx_count_distinct"):
+                if metric.name not in (preagg.measures or []):
+                    return False
+                if not self._is_exact_grain(preagg, query_dimensions, query_granularity):
+                    return False
+                continue
+
             if not self._is_measure_derivable(metric, preagg):
                 return False
 
@@ -137,9 +154,7 @@ class PreAggregationMatcher:
         # All filter columns must be available in the pre-agg
         if filters:
             filter_columns = self._extract_filter_columns(filters)
-            available_columns = set(preagg.dimensions or [])
-            if preagg.time_dimension:
-                available_columns.add(preagg.time_dimension)
+            available_columns = self._available_filter_columns(preagg)
 
             for col in filter_columns:
                 if col not in available_columns:
@@ -160,15 +175,36 @@ class PreAggregationMatcher:
 
         columns = set()
         for filter_expr in filters:
-            # Remove model prefix if present (e.g., "orders.status" -> "status")
-            # Simple regex to extract column names before operators
-            # This handles: column = value, column >= value, etc.
-            matches = re.findall(r"(\w+\.)?(\w+)\s*[=<>!]", filter_expr)
-            for match in matches:
-                # match[0] is model prefix (optional), match[1] is column name
-                columns.add(match[1])
+            try:
+                import sqlglot
+                from sqlglot import exp
+
+                parsed = sqlglot.parse_one(filter_expr)
+                parsed_columns = set()
+                for column in parsed.find_all(exp.Column):
+                    if column.find_ancestor(exp.Select):
+                        continue
+                    parsed_columns.add(column.name)
+                if parsed_columns:
+                    columns.update(parsed_columns)
+                    continue
+            except Exception:
+                pass
+
+            # Fallback for malformed or dialect-specific predicates.
+            matches = re.findall(r"(?:(\w+)\.)?(\w+)\s*(?:=|<>|!=|<=|>=|<|>|IN|BETWEEN|LIKE|IS)\b", filter_expr, re.I)
+            for _table_name, column_name in matches:
+                columns.add(column_name)
 
         return columns
+
+    def _available_filter_columns(self, preagg: PreAggregation) -> set[str]:
+        available_columns = set(preagg.dimensions or [])
+        if preagg.time_dimension:
+            available_columns.add(preagg.time_dimension)
+            if preagg.granularity:
+                available_columns.add(f"{preagg.time_dimension}__{preagg.granularity}")
+        return available_columns
 
     def _is_measure_derivable(self, query_metric: Metric, preagg: PreAggregation) -> bool:
         """Check if a metric can be derived from pre-aggregation measures.
@@ -182,6 +218,19 @@ class PreAggregationMatcher:
         """
         preagg_measures = preagg.measures or []
 
+        # Complete-expression measures (e.g. number_agg / PERCENTILE) carry a full aggregate
+        # in sql that cannot be re-derived from a rollup's stored columns, so they are never
+        # rollup-derivable (the materializer likewise does not store them).
+        if getattr(query_metric, "sql_is_complete", False):
+            return False
+
+        # Complex metrics can be rebuilt from additive leaf state even when
+        # the derived metric itself is not materialized.
+        if query_metric.type in {"ratio", "derived"} or (
+            not query_metric.type and not query_metric.agg and query_metric.sql
+        ):
+            return self._complex_metric_derivable(query_metric, preagg)
+
         # Check if metric is in the pre-agg measures list
         if query_metric.name not in preagg_measures:
             return False
@@ -190,9 +239,6 @@ class PreAggregationMatcher:
         agg_type = query_metric.agg
 
         if not agg_type:
-            # Complex metric types (ratio, derived, etc.)
-            # For now, conservatively require all component metrics to be present
-            # TODO: More sophisticated logic for derived metrics
             return True
 
         # Simple aggregations
@@ -207,12 +253,31 @@ class PreAggregationMatcher:
             count_measure = self._find_count_measure_for_avg(query_metric, preagg_measures)
             return count_measure is not None
 
-        if agg_type == "count_distinct":
-            # COUNT DISTINCT is NOT derivable from pre-aggregated data
-            # (would need HyperLogLog or storing exact values)
+        if agg_type in ("count_distinct", "approx_count_distinct"):
+            # COUNT DISTINCT is NOT derivable from re-aggregated pre-agg rows
+            # (would need HyperLogLog or storing exact values). approx_count_distinct
+            # would be additive if we stored HLL sketches, but sidemantic materializes a
+            # plain integer, so it is not safely rollup-derivable either.
             return False
 
         # Default: allow if present
+        return True
+
+    def _complex_metric_derivable(self, query_metric: Metric, preagg: PreAggregation) -> bool:
+        preagg_measures = set(preagg.measures or [])
+        dependencies = query_metric.get_dependencies(model_context=self.model.name)
+        if not dependencies:
+            return query_metric.name in preagg_measures
+
+        for dependency in dependencies:
+            dep_name = dependency.split(".", 1)[1] if "." in dependency else dependency
+            dep_metric = self.model.get_metric(dep_name)
+            if not dep_metric:
+                return False
+            if dep_metric.agg not in {"sum", "count"}:
+                return False
+            if dep_name not in preagg_measures:
+                return False
         return True
 
     def _find_count_measure_for_avg(self, avg_metric: Metric, preagg_measures: list[str]) -> str | None:
@@ -225,38 +290,97 @@ class PreAggregationMatcher:
         Returns:
             Name of the count measure, or None if not found
         """
-        # Look for count measures in priority order:
-        # 1. Exact match: if avg is "avg_amount", look for "count_amount"
-        # 2. Exact match: if avg is "revenue_avg", look for "revenue_count"
-        # 3. Generic "count" measure
-        # 4. Any count measure (order_count, user_count, etc.)
-
-        # Try exact match with _count suffix (e.g., avg_amount -> count_amount)
+        candidates = []
         if avg_metric.name.startswith("avg_"):
-            base_name = avg_metric.name[4:]  # Remove "avg_" prefix
-            count_candidate = f"count_{base_name}"
-            if count_candidate in preagg_measures:
-                return count_candidate
-
-        # Try exact match with count_ prefix (e.g., revenue_avg -> revenue_count)
+            candidates.append(f"count_{avg_metric.name[4:]}")
         if "_avg" in avg_metric.name:
-            base_name = avg_metric.name.replace("_avg", "_count")
-            if base_name in preagg_measures:
-                return base_name
-
-        # Try generic "count"
-        if "count" in preagg_measures:
-            return "count"
-
-        # Accept any count measure as a fallback
-        # This is safe for AVG re-aggregation as long as:
-        # 1. The count matches the avg's population (unfiltered for unfiltered avg)
-        # 2. We're re-aggregating at compatible grain
-        for measure in preagg_measures:
-            if measure.startswith("count") or "count" in measure:
-                return measure
-
+            candidates.append(avg_metric.name.replace("_avg", "_count"))
+        candidates.extend(["count", *preagg_measures])
+        for name in dict.fromkeys(candidates):
+            if name not in preagg_measures:
+                continue
+            count_metric = self.model.get_metric(name)
+            if count_metric and self._count_matches_average_population(avg_metric, count_metric):
+                return name
         return None
+
+    def _count_matches_average_population(self, average: Metric, count: Metric) -> bool:
+        """An AVG denominator must count the same qualifying non-null inputs."""
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.errors import SqlglotError
+
+        from sidemantic.sql.fragment import replace_outside_sql_protected
+
+        if count.agg != "count" or count.type not in (None, "simple") or count.sql_is_complete:
+            return False
+
+        def normalize(sql):
+            sql = replace_outside_sql_protected(sql, "{model}", self.model.name)
+            expression = sqlglot.parse_one(sql, read="duckdb")
+            for column in expression.find_all(exp.Column):
+                if len(column.parts) > 2 or column.table not in ("", self.model.name):
+                    return None
+                column.set("table", None)
+            return expression
+
+        def same_expression(left, right):
+            if left.strip() == right.strip():
+                return True
+            try:
+                normalized = normalize(left)
+                return normalized is not None and normalized == normalize(right)
+            except SqlglotError:
+                return False
+
+        if len(average.filters or []) != len(count.filters or []) or not all(
+            same_expression(left, right) for left, right in zip(average.filters or [], count.filters or [], strict=True)
+        ):
+            return False
+        count_input = count.sql or "*"
+        if same_expression(average.sql_expr, count_input):
+            return True
+
+        def nonnull(expression):
+            if isinstance(expression, (exp.Literal, exp.Boolean)):
+                return True
+            if isinstance(expression, (exp.Paren, exp.Neg)):
+                return nonnull(expression.this)
+            if isinstance(expression, (exp.Add, exp.Sub, exp.Mul)):
+                return nonnull(expression.this) and nonnull(expression.expression)
+            if isinstance(expression, exp.Coalesce):
+                return any(nonnull(value) for value in [expression.this, *expression.expressions])
+            if isinstance(expression, exp.Case):
+                default = expression.args.get("default")
+                return (
+                    default is not None
+                    and nonnull(default)
+                    and all(nonnull(branch.args["true"]) for branch in expression.args.get("ifs", []))
+                )
+            return False
+
+        try:
+            if not nonnull(normalize(average.sql_expr)):
+                return False
+            return count_input.strip() == "*" or nonnull(normalize(count_input))
+        except SqlglotError:
+            return False
+
+    def _is_exact_grain(
+        self,
+        preagg: PreAggregation,
+        query_dimensions: list[str],
+        query_granularity: str | None,
+    ) -> bool:
+        preagg_dims = set(preagg.dimensions or [])
+        query_dims = set(query_dimensions)
+        if preagg.time_dimension:
+            query_dims.discard(preagg.time_dimension)
+        if query_dims != preagg_dims:
+            return False
+        if preagg.time_dimension or query_granularity:
+            return bool(preagg.time_dimension) and query_granularity == preagg.granularity
+        return True
 
     def _is_granularity_compatible(
         self,
@@ -341,5 +465,189 @@ class PreAggregationMatcher:
                 query_level = GRANULARITY_HIERARCHY.get(query_granularity, 0)
                 preagg_level = GRANULARITY_HIERARCHY.get(preagg.granularity, 0)
                 score -= abs(query_level - preagg_level) * 5
+        elif not query_granularity and preagg.granularity:
+            # A total query can be answered from a time rollup, but an
+            # otherwise-equivalent total rollup is smaller and should win.
+            score -= 20
 
         return score
+
+    def explain_query(
+        self,
+        preagg: PreAggregation,
+        query_metrics: list[str],
+        query_dimensions: list[str],
+        query_granularity: str | None = None,
+        filters: list[str] | None = None,
+    ) -> PreaggCandidate:
+        """Evaluate a pre-aggregation with detailed check results.
+
+        Same logic as can_satisfy_query but returns structured check details
+        instead of a boolean.
+        """
+        # original_sql pre-aggregations are staged base tables, not queryable rollups.
+        if preagg.type == "original_sql":
+            return PreaggCandidate(
+                name=preagg.name,
+                matched=False,
+                score=None,
+                selected=False,
+                checks=[PreaggCheck("type", False, "original_sql is a staged base table, not a queryable rollup")],
+            )
+
+        checks: list[PreaggCheck] = []
+
+        # 1. Dimension subset check
+        preagg_dims = set(preagg.dimensions or [])
+        query_dims = set(query_dimensions)
+        if preagg.time_dimension:
+            query_dims.discard(preagg.time_dimension)
+
+        dims_ok = query_dims.issubset(preagg_dims)
+        if dims_ok:
+            if query_dims:
+                checks.append(
+                    PreaggCheck(
+                        "dimensions",
+                        True,
+                        f"query {{{', '.join(sorted(query_dims))}}} subset of preagg {{{', '.join(sorted(preagg_dims))}}}",
+                    )
+                )
+            else:
+                checks.append(PreaggCheck("dimensions", True, "no non-time dimensions required"))
+        else:
+            missing = query_dims - preagg_dims
+            checks.append(
+                PreaggCheck(
+                    "dimensions",
+                    False,
+                    f"query needs {{{', '.join(sorted(missing))}}} not in preagg {{{', '.join(sorted(preagg_dims))}}}",
+                )
+            )
+
+        # 2. Measure derivability check
+        measures_ok = True
+        measure_details = []
+        for metric_name in query_metrics:
+            metric = self.model.get_metric(metric_name)
+            if not metric:
+                measure_details.append(f"{metric_name} (not found)")
+                measures_ok = False
+            elif metric.agg in ("count_distinct", "approx_count_distinct") and metric.name in (preagg.measures or []):
+                if self._is_exact_grain(preagg, query_dimensions, query_granularity):
+                    measure_details.append(f"{metric_name} ({metric.agg} exact grain)")
+                else:
+                    measure_details.append(f"{metric_name} ({metric.agg}_not_rollup_safe)")
+                    measures_ok = False
+            elif not self._is_measure_derivable(metric, preagg):
+                agg = metric.agg or "complex"
+                if agg in ("count_distinct", "approx_count_distinct"):
+                    measure_details.append(f"{metric_name} ({agg}_not_rollup_safe)")
+                elif agg == "avg":
+                    measure_details.append(f"{metric_name} (avg needs companion count measure)")
+                elif metric.name not in (preagg.measures or []):
+                    measure_details.append(f"{metric_name} (not in preagg measures)")
+                else:
+                    measure_details.append(f"{metric_name} (not derivable)")
+                measures_ok = False
+            else:
+                agg = metric.agg or "complex"
+                measure_details.append(f"{metric_name} ({agg})")
+
+        if query_metrics:
+            checks.append(
+                PreaggCheck(
+                    "measures",
+                    measures_ok,
+                    f"{', '.join(measure_details)}{'' if measures_ok else ''}",
+                )
+            )
+        else:
+            checks.append(PreaggCheck("measures", True, "no metrics required"))
+
+        # 3. Granularity compatibility check
+        if query_granularity and preagg.granularity:
+            gran_ok = self._is_granularity_compatible(query_granularity, preagg.granularity)
+            if gran_ok:
+                if query_granularity == preagg.granularity:
+                    detail = f"{query_granularity} (exact match)"
+                else:
+                    detail = f"query {query_granularity} rollable from preagg {preagg.granularity}"
+            else:
+                detail = f"query {query_granularity} cannot roll up from preagg {preagg.granularity}"
+            checks.append(PreaggCheck("granularity", gran_ok, detail))
+        else:
+            checks.append(PreaggCheck("granularity", True, "not constrained"))
+
+        # 4. Filter compatibility check
+        filters = filters or []
+        if filters:
+            filter_columns = self._extract_filter_columns(filters)
+            available_columns = self._available_filter_columns(preagg)
+
+            missing_cols = {col for col in filter_columns if col not in available_columns}
+            filters_ok = len(missing_cols) == 0
+            if filters_ok:
+                checks.append(
+                    PreaggCheck(
+                        "filters",
+                        True,
+                        f"filter columns {{{', '.join(sorted(filter_columns))}}} all available",
+                    )
+                )
+            else:
+                checks.append(
+                    PreaggCheck(
+                        "filters",
+                        False,
+                        f"filter columns {{{', '.join(sorted(missing_cols))}}} not in preagg",
+                    )
+                )
+        else:
+            checks.append(PreaggCheck("filters", True, "none"))
+
+        matched = all(c.passed for c in checks)
+        score = self._score_match(preagg, query_dimensions, query_granularity) if matched else None
+
+        return PreaggCandidate(
+            name=preagg.name,
+            matched=matched,
+            score=score,
+            selected=False,
+            checks=checks,
+        )
+
+    def explain_matching(
+        self,
+        metrics: list[str] | None = None,
+        dimensions: list[str] | None = None,
+        time_granularity: str | None = None,
+        filters: list[str] | None = None,
+    ) -> list[PreaggCandidate]:
+        """Evaluate all pre-aggregation candidates with detailed explanations.
+
+        Returns a list of PreaggCandidate, one per pre-aggregation defined on the
+        model, with the best match marked as selected.
+        """
+        metrics = metrics or []
+        dimensions = dimensions or []
+        filters = filters or []
+
+        candidates = []
+        for preagg in self.model.pre_aggregations:
+            candidate = self.explain_query(
+                preagg=preagg,
+                query_metrics=metrics,
+                query_dimensions=dimensions,
+                query_granularity=time_granularity,
+                filters=filters,
+            )
+            candidates.append(candidate)
+
+        # Mark the best match as selected
+        matched = [(c, c.score) for c in candidates if c.matched and c.score is not None]
+        if matched:
+            matched.sort(key=lambda x: x[1], reverse=True)
+            matched[0][0].selected = True
+
+        return candidates

@@ -93,6 +93,11 @@ class TestServerConnectionAdapterIntegration:
         class MockAdapter:
             dialect = "duckdb"
 
+            def cursor(self):
+                # Each query runs on a per-request cursor; the mock delegates to itself
+                # so adapter_calls still records the SQL the handler executes.
+                return self
+
             def execute(self, sql):
                 adapter_calls.append(sql)
                 return MockResult()
@@ -141,6 +146,11 @@ class TestServerConnectionAdapterIntegration:
         class MockAdapter:
             dialect = "duckdb"
 
+            def cursor(self):
+                # Each query runs on a per-request cursor; the mock delegates to itself
+                # so adapter_calls still records the SQL the handler executes.
+                return self
+
             def execute(self, sql):
                 adapter_calls.append(sql)
                 return MockResult()
@@ -185,6 +195,11 @@ class TestServerConnectionAdapterIntegration:
 
         class MockAdapter:
             dialect = "duckdb"
+
+            def cursor(self):
+                # Each query runs on a per-request cursor; the mock delegates to itself
+                # so adapter_calls still records the SQL the handler executes.
+                return self
 
             def execute(self, sql):
                 adapter_calls.append(sql)
@@ -422,8 +437,183 @@ models:
         assert called["directory"] == tmp_path
 
 
+class TestSemanticLayerExitClosesAdapter:
+    """Verify SemanticLayer closes adapter on __exit__."""
+
+    def test_exit_closes_adapter(self):
+        layer = SemanticLayer(auto_register=False)
+        mock_adapter = MagicMock()
+        mock_adapter.close = MagicMock()
+        layer.adapter = mock_adapter
+
+        layer.__exit__(None, None, None)
+        mock_adapter.close.assert_called_once()
+
+    def test_exit_works_without_close_method(self):
+        layer = SemanticLayer(auto_register=False)
+        mock_adapter = MagicMock(spec=[])  # No close method
+        layer.adapter = mock_adapter
+
+        # Should not raise even if adapter has no close
+        layer.__exit__(None, None, None)
+
+
 class TestWidgetAdapterIntegration:
     """Tests for widget using adapter interface."""
+
+    def test_widget_generator_uses_layer_dialect(self):
+        """Widget should construct SQLGenerator with layer.dialect in SemanticLayer mode."""
+        pytest.importorskip("pyarrow")
+        pytest.importorskip("anywidget")
+
+        import sqlglot
+
+        from sidemantic.widget import MetricsExplorer
+
+        # Use DuckDB backend but override dialect to ensure generator follows layer.dialect.
+        layer = SemanticLayer(connection="duckdb:///:memory:", dialect="postgres")
+        layer.add_model(
+            Model(
+                name="orders",
+                table="orders_table",
+                dimensions=[
+                    Dimension(name="order_date", sql="order_date", type="time", granularity="day"),
+                    Dimension(name="status", sql="status", type="categorical"),
+                ],
+                metrics=[Metric(name="order_count", agg="count")],
+            )
+        )
+        layer.adapter.execute("CREATE TABLE orders_table (id INT, order_date DATE, status VARCHAR)")
+        layer.adapter.execute(
+            "INSERT INTO orders_table VALUES (1, '2024-01-01', 'completed'), (2, '2024-01-02', 'pending')"
+        )
+
+        widget = MetricsExplorer(
+            layer,
+            metrics=["orders.order_count"],
+            dimensions=["orders.status"],
+            time_dimension="order_date",
+        )
+
+        assert widget._generator.dialect == "postgres"
+
+        # Generated SQL should be parseable under the chosen dialect.
+        sql = widget._generator.generate(
+            metrics=["orders.order_count"],
+            dimensions=["orders.order_date__day"],
+            filters=[],
+            order_by=["orders.order_date__day"],
+            limit=10,
+            skip_default_time_dimensions=True,
+            use_preaggregations=getattr(layer, "use_preaggregations", False),
+        )
+        sqlglot.parse_one(sql, dialect="postgres")
+
+    def test_widget_date_range_query_handles_qualified_table(self):
+        """Date range query should handle qualified table names like schema.table."""
+        pytest.importorskip("pyarrow")
+        pytest.importorskip("anywidget")
+
+        from sidemantic.widget import MetricsExplorer
+
+        layer = SemanticLayer(connection="duckdb:///:memory:")
+        layer.add_model(
+            Model(
+                name="orders",
+                table="s.orders_table",
+                dimensions=[
+                    Dimension(name="order_date", sql="order_date", type="time", granularity="day"),
+                    Dimension(name="status", sql="status", type="categorical"),
+                ],
+                metrics=[Metric(name="order_count", agg="count")],
+            )
+        )
+        layer.adapter.execute("CREATE SCHEMA s")
+        layer.adapter.execute("CREATE TABLE s.orders_table (id INT, order_date DATE, status VARCHAR)")
+        layer.adapter.execute(
+            "INSERT INTO s.orders_table VALUES (1, '2024-01-01', 'completed'), (2, '2024-01-02', 'pending')"
+        )
+
+        widget = MetricsExplorer(
+            layer,
+            metrics=["orders.order_count"],
+            dimensions=["orders.status"],
+            time_dimension="order_date",
+        )
+
+        assert len(widget.date_range) == 2
+        assert widget.date_range[0].startswith("2024-01-01")
+        assert widget.date_range[1].startswith("2024-01-02")
+
+    def test_widget_sets_time_series_column_in_config(self):
+        """Widget should set config.time_series_column based on Arrow schema."""
+        pytest.importorskip("pyarrow")
+        pytest.importorskip("anywidget")
+
+        from sidemantic.widget import MetricsExplorer
+
+        layer = SemanticLayer(connection="duckdb:///:memory:")
+        layer.add_model(
+            Model(
+                name="orders",
+                table="orders_table",
+                dimensions=[
+                    Dimension(name="order_date", sql="order_date", type="time", granularity="day"),
+                    Dimension(name="status", sql="status", type="categorical"),
+                ],
+                metrics=[Metric(name="order_count", agg="count")],
+            )
+        )
+        layer.adapter.execute("CREATE TABLE orders_table (id INT, order_date DATE, status VARCHAR)")
+        layer.adapter.execute(
+            "INSERT INTO orders_table VALUES (1, '2024-01-01', 'completed'), (2, '2024-01-02', 'pending')"
+        )
+
+        widget = MetricsExplorer(
+            layer,
+            metrics=["orders.order_count"],
+            dimensions=["orders.status"],
+            time_dimension="order_date",
+        )
+
+        assert widget.config.get("time_series_column")
+
+    def test_widget_binary_transport_populates_binary_traits(self):
+        """Binary transport should populate Bytes/Dict binary traits and clear base64 traits."""
+        pytest.importorskip("pyarrow")
+        pytest.importorskip("anywidget")
+
+        from sidemantic.widget import MetricsExplorer
+
+        layer = SemanticLayer(connection="duckdb:///:memory:")
+        layer.add_model(
+            Model(
+                name="orders",
+                table="orders_table",
+                dimensions=[
+                    Dimension(name="order_date", sql="order_date", type="time", granularity="day"),
+                    Dimension(name="status", sql="status", type="categorical"),
+                ],
+                metrics=[Metric(name="order_count", agg="count")],
+            )
+        )
+        layer.adapter.execute("CREATE TABLE orders_table (id INT, order_date DATE, status VARCHAR)")
+        layer.adapter.execute(
+            "INSERT INTO orders_table VALUES (1, '2024-01-01', 'completed'), (2, '2024-01-02', 'pending')"
+        )
+
+        widget = MetricsExplorer(
+            layer,
+            metrics=["orders.order_count"],
+            dimensions=["orders.status"],
+            time_dimension="order_date",
+            transport="binary",
+        )
+
+        assert widget.transport == "binary"
+        assert widget.metric_series_data == ""
+        assert isinstance(widget.metric_series_data_binary, (bytes, bytearray))
+        assert widget.metric_series_data_binary
 
     def test_widget_uses_adapter_in_layer_mode(self):
         """Test that widget uses layer.adapter.execute in Semantic Layer mode."""

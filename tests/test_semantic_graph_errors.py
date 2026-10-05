@@ -4,7 +4,7 @@ import pytest
 
 from sidemantic.core.metric import Metric
 from sidemantic.core.model import Model
-from sidemantic.core.semantic_graph import SemanticGraph
+from sidemantic.core.semantic_graph import AmbiguousJoinPathError, SemanticGraph
 from sidemantic.core.table_calculation import TableCalculation
 
 
@@ -119,6 +119,137 @@ def test_find_path_no_relationship():
         graph.find_relationship_path("orders", "customers")
 
 
+def test_find_path_rejects_registration_order_independent_diamond_ambiguity():
+    """Two equally short routes must fail instead of selecting the first declared edge."""
+    from sidemantic.core.relationship import Relationship
+
+    def build_graph(reverse: bool) -> SemanticGraph:
+        first = Relationship(name="c", type="many_to_one", foreign_key="c_id")
+        second = Relationship(name="b", type="many_to_one", foreign_key="b_id")
+        relationships = [first, second] if reverse else [second, first]
+        graph = SemanticGraph()
+        graph.add_model(Model(name="a", table="a", primary_key="id", relationships=relationships))
+        graph.add_model(
+            Model(
+                name="b",
+                table="b",
+                primary_key="id",
+                relationships=[Relationship(name="d", type="many_to_one", foreign_key="d_id")],
+            )
+        )
+        graph.add_model(
+            Model(
+                name="c",
+                table="c",
+                primary_key="id",
+                relationships=[Relationship(name="d", type="many_to_one", foreign_key="d_id")],
+            )
+        )
+        graph.add_model(Model(name="d", table="d", primary_key="id"))
+        return graph
+
+    messages = []
+    for reverse in (False, True):
+        graph = build_graph(reverse)
+        with pytest.raises(AmbiguousJoinPathError) as exc:
+            graph.find_relationship_path("a", "d")
+        messages.append(str(exc.value))
+
+    assert messages[0] == messages[1]
+    assert "a -> b -> d" in messages[0]
+    assert "a -> c -> d" in messages[0]
+
+
+def test_find_path_prefers_a_unique_direct_route_over_longer_alternatives():
+    from sidemantic.core.relationship import Relationship
+
+    graph = SemanticGraph()
+    graph.add_model(
+        Model(
+            name="a",
+            table="a",
+            primary_key="id",
+            relationships=[
+                Relationship(name="b", type="many_to_one", foreign_key="b_id"),
+                Relationship(name="d", type="many_to_one", foreign_key="d_id"),
+            ],
+        )
+    )
+    graph.add_model(
+        Model(
+            name="b",
+            table="b",
+            primary_key="id",
+            relationships=[Relationship(name="d", type="many_to_one", foreign_key="d_id")],
+        )
+    )
+    graph.add_model(Model(name="d", table="d", primary_key="id"))
+
+    path = graph.find_relationship_path("a", "d")
+
+    assert [(hop.from_model, hop.to_model) for hop in path] == [("a", "d")]
+
+
+def test_relationship_path_cache_is_cleared_when_adjacency_is_rebuilt():
+    from sidemantic.core.relationship import Relationship
+
+    graph = SemanticGraph()
+    source = Model(name="a", table="a", primary_key="id")
+    graph.add_model(source)
+    graph.add_model(Model(name="b", table="b", primary_key="id"))
+
+    with pytest.raises(ValueError, match="No join path found"):
+        graph.find_relationship_path("a", "b")
+    assert graph._relationship_path_cache
+
+    source.relationships.append(Relationship(name="b", type="many_to_one", foreign_key="b_id"))
+    graph.build_adjacency()
+
+    assert not graph._relationship_path_cache
+    assert [(hop.from_model, hop.to_model) for hop in graph.find_relationship_path("a", "b")] == [("a", "b")]
+
+
+def test_reciprocal_custom_joins_are_one_semantic_path():
+    from sidemantic.core.relationship import Relationship
+
+    graph = SemanticGraph()
+    graph.add_model(
+        Model(
+            name="a",
+            table="a",
+            primary_key="id",
+            relationships=[
+                Relationship(
+                    name="b",
+                    type="many_to_one",
+                    foreign_key="b_id",
+                    sql="{from}.b_id = {to}.id AND {from}.tenant_id = {to}.tenant_id",
+                )
+            ],
+        )
+    )
+    graph.add_model(
+        Model(
+            name="b",
+            table="b",
+            primary_key="id",
+            relationships=[
+                Relationship(
+                    name="a",
+                    type="one_to_many",
+                    foreign_key="b_id",
+                    sql="{from}.tenant_id = {to}.tenant_id AND {from}.id = {to}.b_id",
+                )
+            ],
+        )
+    )
+
+    path = graph.find_relationship_path("a", "b")
+
+    assert len(path) == 1
+    assert path[0].custom_condition is not None
+
+
 def test_auto_register_time_comparison_metric():
     """Test that time_comparison metrics are auto-registered at graph level."""
     graph = SemanticGraph()
@@ -162,3 +293,100 @@ def test_no_auto_register_regular_metrics():
 
     # But should be accessible via model
     assert len(model.metrics) == 2
+
+
+def test_adjacency_not_built_on_add():
+    """Adjacency should not be rebuilt on every add_model."""
+    from sidemantic.core.relationship import Relationship
+
+    graph = SemanticGraph()
+
+    orders = Model(
+        name="orders",
+        table="orders",
+        primary_key="order_id",
+        relationships=[
+            Relationship(name="customers", type="many_to_one", foreign_key="customer_id"),
+        ],
+    )
+    customers = Model(name="customers", table="customers", primary_key="id")
+
+    graph.add_model(orders)
+    graph.add_model(customers)
+
+    assert graph._adjacency_dirty is True
+
+
+def test_adjacency_built_on_find_path():
+    """find_relationship_path should trigger lazy adjacency rebuild."""
+    from sidemantic.core.relationship import Relationship
+
+    graph = SemanticGraph()
+
+    orders = Model(
+        name="orders",
+        table="orders",
+        primary_key="order_id",
+        relationships=[
+            Relationship(name="customers", type="many_to_one", foreign_key="customer_id"),
+        ],
+    )
+    customers = Model(name="customers", table="customers", primary_key="id")
+
+    graph.add_model(orders)
+    graph.add_model(customers)
+
+    path = graph.find_relationship_path("orders", "customers")
+    assert len(path) == 1
+    assert graph._adjacency_dirty is False
+
+
+def test_one_to_many_path_can_use_tmdl_from_column_override():
+    """Imported TMDL relationships preserve explicit fromColumn join keys."""
+    from sidemantic.core.relationship import Relationship
+
+    graph = SemanticGraph()
+
+    relationship = Relationship(name="customers", type="one_to_many", foreign_key="product_key")
+    relationship._tmdl_from_column = "product_key"
+    products = Model(
+        name="products",
+        table="products",
+        primary_key="internal_product_id",
+        relationships=[relationship],
+    )
+    customers = Model(name="customers", table="customers", primary_key="customer_id")
+
+    graph.add_model(products)
+    graph.add_model(customers)
+
+    path = graph.find_relationship_path("products", "customers")
+    assert [(hop.from_columns, hop.to_columns) for hop in path] == [(["product_key"], ["product_key"])]
+
+
+def test_inactive_relationship_is_not_used_for_default_path():
+    """Inactive imported relationships must not participate in normal SQL pathing."""
+    from sidemantic.core.relationship import Relationship
+
+    graph = SemanticGraph()
+    sales = Model(
+        name="sales",
+        table="sales",
+        primary_key="id",
+        relationships=[
+            Relationship(
+                name="calendar",
+                type="many_to_one",
+                foreign_key="ship_date_key",
+                primary_key="date_key",
+                active=False,
+            )
+        ],
+    )
+    calendar = Model(name="calendar", table="calendar", primary_key="date_key")
+
+    graph.add_model(sales)
+    graph.add_model(calendar)
+
+    with pytest.raises(ValueError, match="No join path found"):
+        graph.find_relationship_path("sales", "calendar")

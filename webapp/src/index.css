@@ -1,0 +1,251 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Font tokens — hosts (and the /typography gallery) can restyle the whole app by
+   * overriding these three variables; nothing below hardcodes a family. */
+  --font-sans: "Geist Sans", Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-display: var(--font-sans);
+}
+
+:root,
+:root[data-theme="light"] {
+  /* Sidequery design tokens — warm parchment neutrals, near-black ink, a gold accent
+   * thread, and an earthy categorical palette. The accent is the TEXT-SAFE gold
+   * (decorative brand gold fails contrast as text on light surfaces). */
+  --bg: #f6f5f1;
+  --surface: #ffffff;
+  --surface-soft: #f0eee8;
+  --ink: #1b1917;
+  --muted: #45403a;
+  --faint: #8b8378;
+  --line: #e7e4dd;
+  --line-strong: #d8d2c8;
+  --accent: #8a6116;
+  --accent-hover: #6d4c0f;
+  --accent-soft: #fff6e2;
+  --focus: #1b1917;
+  --danger: #dc2626;
+  --danger-soft: rgba(239, 68, 68, 0.1);
+  --success: #047857;
+  --success-soft: rgba(16, 185, 129, 0.1);
+  --chart-primary: #5b7fa6;
+  --chart-primary-soft: rgba(91, 127, 166, 0.16);
+  --chart-primary-selected: rgba(91, 127, 166, 0.26);
+  /* Categorical series palette for multi-series charts (donut, stacked area, network groups). */
+  --viz-1: #5b7fa6; /* slate */
+  --viz-2: #6fa287; /* sage */
+  --viz-3: #c06e52; /* terracotta */
+  --viz-4: #d9a441; /* ochre */
+  --viz-5: #8b7bb0; /* heather */
+  --viz-6: #c98ba4; /* rose */
+  --viz-7: #5fa3a8; /* teal-stone */
+  --shadow-sm: 0 1px 2px 0 rgba(27, 25, 23, 0.04), 0 1px 3px 0 rgba(27, 25, 23, 0.06);
+  --shadow: 0 8px 18px -12px rgba(27, 25, 23, 0.18), 0 2px 8px -4px rgba(27, 25, 23, 0.12);
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg: #141312;
+  --surface: #1c1a18;
+  --surface-soft: #25231f;
+  --ink: #f4f2ee;
+  --muted: #d8d2c8;
+  --faint: #958c80;
+  --line: #2e2b27;
+  --line-strong: #423d36;
+  --accent: #f1bd5b;
+  --accent-hover: #f6d083;
+  --accent-soft: #342817;
+  --focus: #f4f2ee;
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.15);
+  --success: #6ee7b7;
+  --success-soft: rgba(52, 211, 153, 0.15);
+  --chart-primary: #7a9cc0;
+  --chart-primary-soft: rgba(122, 156, 192, 0.2);
+  --chart-primary-selected: rgba(122, 156, 192, 0.32);
+  --viz-1: #7a9cc0;
+  --viz-2: #8cbba1;
+  --viz-3: #d98a6e;
+  --viz-4: #e7b95c;
+  --viz-5: #a796c8;
+  --viz-6: #d9a4bc;
+  --viz-7: #7cbec3;
+  --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.3), 0 1px 2px -1px rgba(0, 0, 0, 0.3);
+  --shadow: 0 10px 18px -12px rgba(0, 0, 0, 0.45), 0 2px 8px -4px rgba(0, 0, 0, 0.35);
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  /* Geist first: hosts that load it (the Sidequery platform) get the brand face,
+   * everyone else falls back cleanly. */
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+summary {
+  touch-action: manipulation;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button:not(:disabled),
+summary:not([aria-disabled="true"]),
+select:not(:disabled) {
+  cursor: pointer;
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  cursor: not-allowed;
+}
+
+/* Tighter tracking on headings so titles read intentional, not default. Headings take the
+ * display face, which defaults to the sans — override --font-display for an editorial look. */
+h1 {
+  letter-spacing: -0.025em;
+}
+h2,
+h3 {
+  letter-spacing: -0.018em;
+}
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+}
+
+/* Numbers, ids, codes read as mono with tabular figures — the precise "data tool" feel. */
+.tnum {
+  font-feature-settings: "tnum";
+  font-variant-numeric: tabular-nums;
+}
+
+/* Keep a high-contrast focus indicator visible on both themes. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+/* Thin, theme-aware scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 6px;
+  border: 2px solid var(--bg);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--faint);
+}
+
+/* Per-panel skeleton shimmer used while a query is in flight. */
+@keyframes skeleton-pulse {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-soft) 25%, var(--line) 37%, var(--surface-soft) 63%);
+  background-size: 200% 100%;
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spinner {
+  animation: spin 0.7s linear infinite;
+}
+
+/* The static/WASM leaderboard is the visual champion. Keep compact desktop rows while preserving
+   touch-sized targets on coarse pointers. */
+@media (hover: hover) and (pointer: fine) {
+  .leaderboard-row:hover {
+    background-color: var(--surface-soft);
+  }
+}
+
+@media (pointer: coarse) {
+  button,
+  summary,
+  select,
+  input:not([type="checkbox"]):not([type="radio"]) {
+    min-height: 44px;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]),
+  select {
+    font-size: 16px;
+  }
+
+  button[aria-label] {
+    min-width: 44px;
+  }
+
+  .leaderboard-row,
+  .leaderboard-expand,
+  .table-sort,
+  .table-pager-button {
+    min-height: 44px;
+  }
+  .table-pager-button {
+    min-width: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .skeleton,
+  .spinner {
+    animation: none;
+  }
+}

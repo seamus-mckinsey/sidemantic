@@ -1,9 +1,36 @@
 """Test metric-level filters."""
 
 import duckdb
+from sqlglot import exp, parse_one
 
 from sidemantic import Dimension, Metric, Model, SemanticLayer
+from sidemantic.sql.generator import SQLGenerator
 from tests.utils import df_rows
+
+
+def _assert_metric_filter(sql, model, metric, predicate, input_column, *, where=None):
+    """Check the named raw projection, keeping measure filters out of row scope."""
+
+    def without_parentheses(expression):
+        return expression.transform(lambda node: node.this if isinstance(node, exp.Paren) else node)
+
+    query = parse_one(sql, read="duckdb")
+    cte = next(cte for cte in query.find_all(exp.CTE) if cte.alias == f"{model}_cte")
+    projection = next(expression for expression in cte.this.expressions if expression.alias == f"{metric}_raw")
+    case = projection.this
+    assert isinstance(case, exp.Case)
+    assert case.this is None
+    assert len(case.args["ifs"]) == 1
+    branch = case.args["ifs"][0]
+    assert without_parentheses(branch.this) == without_parentheses(parse_one(predicate, read="duckdb"))
+    assert branch.args["true"] == exp.column(input_column)
+    assert case.args.get("default") is None or isinstance(case.args["default"], exp.Null)
+    row_filter = cte.this.args.get("where")
+    if where is None:
+        assert row_filter is None
+    else:
+        assert row_filter is not None
+        assert without_parentheses(row_filter.this) == without_parentheses(parse_one(where, read="duckdb"))
 
 
 def test_metric_level_filter_basic(layer):
@@ -43,7 +70,7 @@ def test_metric_level_filter_basic(layer):
     print(sql)
 
     # Filter should be in CTE's CASE WHEN on raw column, not in outer query
-    assert "CASE WHEN status = 'completed' THEN amount" in sql
+    _assert_metric_filter(sql, "orders", "completed_revenue", "status = 'completed'", "amount")
     # Outer query should just aggregate the pre-filtered raw column
     assert "SUM(orders_cte.completed_revenue_raw)" in sql
 
@@ -75,7 +102,9 @@ def test_metric_level_multiple_filters(layer):
     sql = layer.compile(metrics=["orders.high_value_completed_revenue"])
 
     # Should contain both filters combined via CASE WHEN in CTE
-    assert "CASE WHEN status = 'completed' AND amount > 100" in sql
+    _assert_metric_filter(
+        sql, "orders", "high_value_completed_revenue", "status = 'completed' AND amount > 100", "amount"
+    )
     assert "high_value_completed_revenue_raw" in sql
 
 
@@ -105,7 +134,7 @@ def test_metric_filters_combined_with_query_filters(layer):
     sql = layer.compile(metrics=["orders.completed_revenue"], filters=["orders_cte.region = 'US'"])
 
     # Metric filter should be in CASE WHEN, query filter pushed down to CTE WHERE
-    assert "CASE WHEN status = 'completed'" in sql  # Metric filter in CTE
+    _assert_metric_filter(sql, "orders", "completed_revenue", "status = 'completed'", "amount", where="region = 'US'")
     assert "region = 'US'" in sql  # Query filter pushed down into CTE
 
 
@@ -140,7 +169,7 @@ def test_mixed_filtered_and_unfiltered_metrics(layer):
     sql = layer.compile(metrics=["orders.total_revenue", "orders.completed_revenue"])
 
     # Completed filter should be in CASE WHEN for completed_revenue only
-    assert "CASE WHEN status = 'completed'" in sql
+    _assert_metric_filter(sql, "orders", "completed_revenue", "status = 'completed'", "amount")
     assert "completed_revenue_raw" in sql
     # Total revenue should have no CASE WHEN
     assert "amount AS total_revenue_raw" in sql
@@ -174,7 +203,9 @@ def test_metric_filter_with_time_dimension(layer):
     sql = layer.compile(metrics=["orders.recent_completed_revenue"], dimensions=["orders.created_at__month"])
 
     # Both filters should be in CASE WHEN combined with AND
-    assert "CASE WHEN status = 'completed' AND created_at >= CURRENT_DATE" in sql
+    _assert_metric_filter(
+        sql, "orders", "recent_completed_revenue", "status = 'completed' AND created_at >= CURRENT_DATE - 30", "amount"
+    )
     assert "recent_completed_revenue_raw" in sql
 
 
@@ -219,7 +250,13 @@ def test_metric_filter_column_not_in_query_dimensions(layer):
     assert "state" in cte_match, f"'state' column should be in CTE SELECT for filter to work. CTE: {cte_match}"
 
     # The filter should be in a CASE WHEN expression
-    assert "CASE WHEN state IN ('confirmed', 'completed', 'cancelled')" in sql
+    _assert_metric_filter(
+        sql,
+        "bookings",
+        "gross_booking_value",
+        "state IN ('confirmed', 'completed', 'cancelled')",
+        "gross_booking_value",
+    )
 
 
 def test_metric_filter_multiple_columns_not_in_dimensions(layer):
@@ -352,6 +389,148 @@ def test_mixed_filters_separate_where_and_having(layer):
     assert "status = 'completed'" in sql
     assert "HAVING" in sql
     assert "revenue > 100" in sql
+
+
+def test_filter_classification_ignores_metric_names_in_non_column_tokens():
+    layer = SemanticLayer()
+    layer.add_model(
+        Model(
+            name="orders",
+            table="orders_table",
+            dimensions=[Dimension(name="status", type="categorical")],
+            metrics=[Metric(name="revenue", agg="sum", sql="amount")],
+        )
+    )
+    generator = SQLGenerator(layer.graph)
+    predicates = [
+        "orders.status = 'orders.revenue'",
+        '"orders.revenue" = 1',
+        "orders.status = 'paid' -- orders.revenue",
+        "orders.status = $$orders.revenue$$",
+    ]
+
+    assert generator._split_where_having_filters(predicates, ["orders"]) == (predicates, [])
+    assert generator._split_where_having_filters(["orders.revenue > 100"], ["orders"]) == (
+        [],
+        ["orders.revenue > 100"],
+    )
+
+
+def test_where_filter_rewrite_only_changes_semantic_columns():
+    layer = SemanticLayer()
+    layer.add_model(
+        Model(
+            name="orders",
+            table="orders_table",
+            dimensions=[Dimension(name="status", type="categorical")],
+            metrics=[Metric(name="revenue", agg="sum", sql="amount")],
+        )
+    )
+    generator = SQLGenerator(layer.graph, dialect="postgres")
+    predicate = (
+        "orders.status = 'orders.revenue' "
+        'AND "orders.revenue" = "orders.revenue" '
+        "AND orders.status <> $$orders.status$$ /* orders.revenue */"
+    )
+
+    query = generator._add_where_filters_to_query(exp.select("*"), [predicate], ["orders"])
+    rendered = query.sql(dialect="postgres")
+
+    assert rendered.count("orders_cte.status") == 2
+    assert "'orders.revenue'" in rendered
+    assert rendered.count('"orders.revenue"') == 2
+    reparsed = parse_one(rendered, dialect="postgres")
+    assert {literal.this for literal in reparsed.find_all(exp.Literal) if literal.is_string} == {
+        "orders.revenue",
+        "orders.status",
+    }
+    assert "orders.revenue" in rendered.split("/*", 1)[1]
+
+
+def test_filter_classification_and_rewrite_respect_nested_select_alias_scope():
+    layer = SemanticLayer()
+    layer.add_model(
+        Model(
+            name="orders",
+            table="orders_table",
+            dimensions=[Dimension(name="status", type="categorical")],
+            metrics=[Metric(name="revenue", agg="sum", sql="amount")],
+        )
+    )
+    generator = SQLGenerator(layer.graph)
+    metric_predicate = "EXISTS (SELECT 1 FROM audit AS orders WHERE orders.revenue > 100)"
+    row_predicate = "EXISTS (SELECT 1 FROM audit AS orders WHERE orders.status = 'paid')"
+
+    assert generator._split_where_having_filters([metric_predicate], ["orders"]) == ([metric_predicate], [])
+    uppercase_alias = "EXISTS (SELECT 1 FROM audit AS ORDERS WHERE orders.revenue > 100)"
+    assert generator._split_where_having_filters([uppercase_alias], ["orders"]) == ([uppercase_alias], [])
+    rendered = generator._add_where_filters_to_query(exp.select("*"), [row_predicate], ["orders"]).sql()
+    assert "orders.status = 'paid'" in rendered
+    assert "orders_cte" not in rendered
+
+    snowflake_generator = SQLGenerator(layer.graph, dialect="snowflake")
+    quoted_folded_alias = 'EXISTS (SELECT 1 FROM audit AS "ORDERS" WHERE orders.revenue > 100)'
+    assert snowflake_generator._split_where_having_filters([quoted_folded_alias], ["orders"]) == (
+        [quoted_folded_alias],
+        [],
+    )
+
+
+def test_structured_filters_resolve_grained_and_computed_dimensions_before_where():
+    layer = SemanticLayer()
+    layer.add_model(
+        Model(
+            name="events",
+            table="events",
+            primary_key="id",
+            dimensions=[
+                Dimension(name="created_at", type="time", sql="occurred_at", granularity="day"),
+                Dimension(name="gross", type="numeric", sql="unit_price * quantity"),
+                Dimension(name="category", type="categorical"),
+            ],
+            metrics=[Metric(name="revenue", agg="sum", sql="amount")],
+        )
+    )
+    layer.conn.execute(
+        """
+        CREATE TABLE events (
+            id INTEGER,
+            occurred_at TIMESTAMP,
+            unit_price DOUBLE,
+            quantity INTEGER,
+            category VARCHAR,
+            amount DOUBLE
+        );
+        INSERT INTO events VALUES
+            (1, '2024-01-15 12:00:00', 5, 2, 'A', 10),
+            (2, '2024-02-10 08:00:00', 12, 2, 'A', 24),
+            (3, '2024-02-12 08:00:00', 4, 2, 'B', 8);
+        """
+    )
+    filters = [
+        "events.created_at__month = DATE '2024-02-01'",
+        "events.gross >= 20",
+    ]
+
+    postgres_sql = layer.compile(
+        metrics=["events.revenue"],
+        dimensions=["events.category"],
+        filters=filters,
+        dialect="postgres",
+    )
+    where_sql = postgres_sql.split("WHERE", 1)[1]
+    assert "created_at__month" not in where_sql
+    assert "events.gross" not in where_sql
+    assert "DATE_TRUNC('MONTH', OCCURRED_AT)" in where_sql.upper()
+    assert "(unit_price * quantity) >= 20" in where_sql
+
+    assert df_rows(
+        layer.query(
+            metrics=["events.revenue"],
+            dimensions=["events.category"],
+            filters=filters,
+        )
+    ) == [("A", 24.0)]
 
 
 def test_metric_level_filters_use_case_when(layer):

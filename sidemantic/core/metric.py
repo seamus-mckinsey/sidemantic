@@ -1,13 +1,13 @@
 """Measure definitions - unified metric/measure abstraction."""
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import Field, model_validator
 
-from .dependency_analyzer import extract_metric_dependencies
+from sidemantic.core.governance import GovernedObject
 
 
-class Metric(BaseModel):
+class Metric(GovernedObject):
     """Measure definition - supports simple aggregations and complex metric types.
 
     Measures can be:
@@ -23,6 +23,11 @@ class Metric(BaseModel):
 
     name: str = Field(..., description="Unique measure name")
     extends: str | None = Field(None, description="Parent metric to inherit from")
+    logical_data_type: str | None = Field(
+        None,
+        exclude=True,
+        description="Source logical result type, independent of aggregation and runtime metric type",
+    )
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -33,10 +38,37 @@ class Metric(BaseModel):
         auto_register_metric(self)
 
     # Basic aggregation (for simple measures)
-    agg: Literal["sum", "count", "count_distinct", "avg", "min", "max", "median"] | None = Field(
-        None, description="Aggregation function (for simple measures)"
-    )
+    agg: (
+        Literal[
+            "sum",
+            "count",
+            "count_distinct",
+            "approx_count_distinct",
+            "avg",
+            "min",
+            "max",
+            "median",
+            "stddev",
+            "stddev_pop",
+            "variance",
+            "variance_pop",
+        ]
+        | None
+    ) = Field(None, description="Aggregation function (for simple measures)")
     sql: str | None = Field(None, description="SQL expression or formula (accepts 'expr' as alias)")
+    dax: str | None = Field(None, description="DAX expression source text")
+    expression_language: Literal["sql", "dax"] | None = Field(
+        None, description="Expression language for sql/expr/dax authoring"
+    )
+    sql_is_complete: bool = Field(
+        False,
+        description=(
+            "When True, treat sql as a complete, opaque expression and skip "
+            "auto-extraction of aggregations. Used for imported measures (e.g. "
+            "Cube/Tesseract number_agg/time/string/boolean) whose sql is already "
+            "the full aggregate expression and must be preserved verbatim with agg=None."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -51,6 +83,10 @@ class Metric(BaseModel):
         Complex expressions like SUM(x) / SUM(y) are preserved as-is.
         """
         if isinstance(data, dict):
+            if data.get("public") is False and "visibility" not in data:
+                data["visibility"] = "private"
+            if data.get("visibility") in {"internal", "private"} and "public" not in data:
+                data["public"] = False
             # Step 1: Handle expr alias
             expr_val = data.get("expr")
             sql_val = data.get("sql")
@@ -70,10 +106,20 @@ class Metric(BaseModel):
             # Step 2: Parse aggregation from SQL if needed
             agg_val = data.get("agg")
             type_val = data.get("type")
+            language_val = data.get("expression_language")
 
             # Parse if sql is provided and agg is not set
             # Allow parsing for simple metrics (no type) OR cumulative metrics (to support AVG/COUNT windows)
-            if sql_val and not agg_val and (not type_val or type_val == "cumulative"):
+            # Skip entirely when sql_is_complete: the sql is an opaque, complete expression
+            # (e.g. imported Cube/Tesseract aggregate measures) that must be preserved verbatim.
+            sql_is_complete = data.get("sql_is_complete", False)
+            if (
+                sql_val
+                and not sql_is_complete
+                and language_val != "dax"
+                and not agg_val
+                and (not type_val or type_val == "cumulative")
+            ):
                 try:
                     import sqlglot
                     from sqlglot import expressions as exp
@@ -89,6 +135,15 @@ class Metric(BaseModel):
                         exp.Max: "max",
                         exp.Median: "median",
                     }
+                    for agg_class_name, agg_name in {
+                        "Stddev": "stddev",
+                        "StddevPop": "stddev_pop",
+                        "Variance": "variance",
+                        "VariancePop": "variance_pop",
+                    }.items():
+                        agg_class = getattr(exp, agg_class_name, None)
+                        if agg_class is not None:
+                            agg_map[agg_class] = agg_name
 
                     agg_func = None
                     inner_expr = None
@@ -130,6 +185,11 @@ class Metric(BaseModel):
                             "min": "min",
                             "max": "max",
                             "median": "median",
+                            "stddev": "stddev",
+                            "stddev_pop": "stddev_pop",
+                            "variance": "variance",
+                            "variance_pop": "variance_pop",
+                            "var_pop": "variance_pop",
                             "count": "count",
                         }
                         if func_name in func_map:
@@ -180,22 +240,51 @@ class Metric(BaseModel):
                 raise ValueError("ratio metric requires 'numerator' field")
             if not self.denominator:
                 raise ValueError("ratio metric requires 'denominator' field")
-        if self.type == "derived" and not self.sql:
+        if self.type == "derived" and not self.sql and not self.has_untranslated_dax:
             raise ValueError("derived metric requires 'sql' field")
         if self.type == "cumulative" and not self.sql and not self.window_expression:
             raise ValueError("cumulative metric requires 'sql' or 'window_expression' field")
         if self.type == "conversion":
             if not self.entity:
                 raise ValueError("conversion metric requires 'entity' field")
-            if not self.base_event:
-                raise ValueError("conversion metric requires 'base_event' field")
-            if not self.conversion_event:
-                raise ValueError("conversion metric requires 'conversion_event' field")
+            if self.steps:
+                if len(self.steps) < 2:
+                    raise ValueError("conversion metric 'steps' requires at least 2 steps")
+                if self.conversion_window:
+                    raise ValueError(
+                        "conversion metric cannot specify both 'steps' and 'conversion_window'; "
+                        "conversion_window is only supported for base_event/conversion_event funnels"
+                    )
+            elif not self.base_event or not self.conversion_event:
+                raise ValueError("conversion metric requires 'steps' or both 'base_event' and 'conversion_event'")
+        if self.type == "retention":
+            if not self.entity:
+                raise ValueError("retention metric requires 'entity' field")
+            if not self.cohort_event:
+                raise ValueError("retention metric requires 'cohort_event' field")
+        if self.type == "cohort":
+            if not self.entity:
+                raise ValueError("cohort metric requires 'entity' field")
+            if not self.inner_metrics:
+                raise ValueError("cohort metric requires 'inner_metrics' field")
+            for i, im in enumerate(self.inner_metrics):
+                if not isinstance(im, dict) or not im.get("name"):
+                    raise ValueError(f"cohort metric inner_metrics[{i}] must be a dict with at least a 'name' key")
+                im_agg = im.get("agg", "count").upper()
+                if im_agg != "COUNT" and not im.get("sql"):
+                    raise ValueError(
+                        f"cohort metric inner_metrics[{i}] ('{im['name']}') "
+                        f"uses agg '{im_agg}' which requires a 'sql' field"
+                    )
+            if not self.having:
+                raise ValueError("cohort metric requires 'having' field")
+            if not self.agg:
+                raise ValueError("cohort metric requires 'agg' field for outer aggregation")
         return self
 
     # Metric type (if this is a complex metric, not just a simple aggregation)
-    type: Literal["ratio", "derived", "cumulative", "time_comparison", "conversion"] | None = Field(
-        None, description="Metric type for complex calculations"
+    type: Literal["ratio", "derived", "cumulative", "time_comparison", "conversion", "retention", "cohort"] | None = (
+        Field(None, description="Metric type for complex calculations")
     )
 
     # Ratio parameters
@@ -238,12 +327,40 @@ class Metric(BaseModel):
     base_event: str | None = Field(None, description="Starting event filter")
     conversion_event: str | None = Field(None, description="Target event filter")
     conversion_window: str | None = Field(None, description="Conversion time window")
+    steps: list[str] | None = Field(
+        None, description="N-step funnel filter expressions (overrides base_event/conversion_event)"
+    )
+
+    # Retention parameters
+    cohort_event: str | None = Field(
+        None, description="SQL filter for cohort-defining event (e.g., \"event = 'install'\")"
+    )
+    activity_event: str | None = Field(
+        None, description='SQL filter for activity event (default: any event, e.g., "event IS NOT NULL")'
+    )
+    periods: int | None = Field(None, description="Number of retention periods to compute (e.g., 28 for 28-day)")
+    retention_granularity: Literal["day", "week", "month"] | None = Field(
+        None, description="Time granularity for retention periods (day, week, month)"
+    )
+
+    # Cohort metric parameters
+    inner_metrics: list[dict[str, Any]] | None = Field(
+        None, description="Per-entity aggregations for cohort metrics (list of {name, agg, sql})"
+    )
+    entity_dimensions: list[str] | None = Field(
+        None, description="Dimensions to carry through from inner to outer aggregation in cohort metrics"
+    )
+    having: str | None = Field(None, description="HAVING filter on inner aggregation for cohort metrics")
 
     # Common parameters
     filters: list[str] | None = Field(None, description="Optional WHERE clause filters")
     fill_nulls_with: int | float | str | None = Field(None, description="Default value when result is NULL")
     description: str | None = Field(None, description="Human-readable description")
     label: str | None = Field(None, description="Display label")
+    metadata: dict[str, Any] | None = Field(None, description="Adapter-specific metadata payload")
+
+    # Synonyms (e.g. Snowflake Cortex Analyst measures/metrics, Cube)
+    synonyms: list[str] | None = Field(None, description="Alternative names for this measure/metric")
 
     # Display formatting
     format: str | None = Field(None, description="Display format string (e.g., '$#,##0.00', '0.00%')")
@@ -257,6 +374,29 @@ class Metric(BaseModel):
         None,
         description="Dimension across which this metric cannot be summed (e.g., time for averages)",
     )
+    non_additive_window: Literal["min", "max"] = Field(
+        "max",
+        description=(
+            "Which value of non_additive_dimension to keep per group when computing a "
+            "semi-additive metric. 'max' (default) keeps the last snapshot (MetricFlow "
+            "default); 'min' keeps the first."
+        ),
+    )
+    non_additive_window_groupings: list[str] | None = Field(
+        None,
+        description=(
+            "Dimensions the semi-additive snapshot is taken per (MetricFlow window_groupings). "
+            "When set, the last/first snapshot is computed per these groupings regardless of the "
+            "query's grouping (e.g. balance-per-user). When unset, the snapshot partitions by the "
+            "query's own non-time grouping dimensions."
+        ),
+    )
+
+    # Arbitrary metadata (ai_context, custom_extensions, etc.)
+    meta: dict[str, Any] | None = Field(None, description="Arbitrary metadata for extensions")
+
+    # Visibility
+    public: bool = Field(True, description="Whether metric is visible in API/UI")
 
     def __hash__(self) -> int:
         return hash((self.name, self.agg, self.sql))
@@ -267,6 +407,11 @@ class Metric(BaseModel):
         if self.agg == "count" and not self.sql:
             return "*"
         return self.sql or self.name
+
+    @property
+    def has_untranslated_dax(self) -> bool:
+        """Whether this metric preserves DAX source without a SQL translation."""
+        return self.expression_language == "dax" and bool(self.dax) and not self.sql and not self.agg
 
     @property
     def is_simple_aggregation(self) -> bool:
@@ -282,7 +427,7 @@ class Metric(BaseModel):
         if not self.agg:
             raise ValueError(f"Cannot convert complex metric '{self.name}' to SQL - use type-specific logic")
 
-        agg_func = self.agg.upper()
+        agg_func = {"variance_pop": "VAR_POP"}.get(self.agg, self.agg.upper())
         if agg_func == "COUNT_DISTINCT":
             agg_func = "COUNT(DISTINCT"
             return f"{agg_func} {self.sql_expr})"
@@ -300,4 +445,6 @@ class Metric(BaseModel):
         Returns:
             Set of measure/metric names this depends on.
         """
+        from .dependency_analyzer import extract_metric_dependencies
+
         return extract_metric_dependencies(self, graph, model_context)
