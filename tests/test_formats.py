@@ -42,6 +42,7 @@ def test_registry_has_stable_names_aliases_and_capabilities():
     assert get_semantic_format("open-semantic-interchange").name == "ossie"
     assert get_semantic_format("rill").output_kind == OutputKind.DIRECTORY
     assert get_semantic_format("tableau").supports_export is False
+    assert get_semantic_format("metabase").supports_export is False
 
 
 def test_registry_reports_unknown_and_unsupported_formats():
@@ -50,6 +51,9 @@ def test_registry_reports_unknown_and_unsupported_formats():
 
     with pytest.raises(UnsupportedFormatOperationError, match="supports import but not export"):
         get_semantic_format("tableau", operation="export")
+
+    with pytest.raises(UnsupportedFormatOperationError, match="supports import but not export"):
+        get_semantic_format("metabase", operation="export")
 
 
 def test_auto_file_load_is_exact_and_does_not_scan_siblings(tmp_path: Path):

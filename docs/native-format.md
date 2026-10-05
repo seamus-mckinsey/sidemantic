@@ -7,7 +7,7 @@ The native format has two source forms:
 - YAML semantic project files.
 - SQL semantic definition files.
 
-The native format is the runtime contract. External formats such as LookML, MetricFlow, Hex, Rill, Malloy, Omni, Superset, GoodData, Snowflake Cortex, ThoughtSpot, Holistics, Tableau, AtScale SML, BSL, Yardstick, and Graphene GSQL should be converted into this format by Python importers before they are expected to run through the Rust native runtime.
+The native format is the runtime contract. External formats such as LookML, MetricFlow, Hex, Rill, Malloy, Omni, Superset, GoodData, Snowflake Cortex, ThoughtSpot, Holistics, Tableau, AtScale SML, BSL, Yardstick, Graphene GSQL, and Metabase should be converted into this format by Python importers before they are expected to run through the Rust native runtime.
 
 ## Rust Loader Scope
 
@@ -19,7 +19,7 @@ input surface than Python:
 
 They do not auto-detect LookML, MetricFlow/dbt manifests, Hex, Rill, Malloy,
 Omni, Superset, GoodData, Snowflake Cortex, ThoughtSpot, Holistics, Tableau,
-AtScale SML, BSL, Yardstick, or other external source formats. Convert those
+AtScale SML, BSL, Yardstick, Metabase, or other external source formats. Convert those
 formats through the Python CLI/API first, then load the exported native YAML/SQL
 with the Rust runtime.
 

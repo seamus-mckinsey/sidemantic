@@ -44,6 +44,7 @@ Rust does not parse these source formats directly:
 - AtScale SML
 - BSL
 - Yardstick
+- Metabase
 - Python semantic definition files
 
 Those remain Python-owned import paths.

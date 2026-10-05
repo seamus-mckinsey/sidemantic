@@ -139,6 +139,11 @@ _FORMATS = (
         output_kind=OutputKind.FILE,
     ),
     SemanticFormat(
+        "metabase",
+        "sidemantic.adapters.metabase",
+        "MetabaseAdapter",
+    ),
+    SemanticFormat(
         "metricflow",
         "sidemantic.adapters.metricflow",
         "MetricFlowAdapter",

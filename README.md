@@ -2,7 +2,7 @@
 
 Sidemantic is an open-source semantic runtime. Define governed metrics once—or import the semantic models you already have—and query them consistently from SQL, the CLI, Python, HTTP, PostgreSQL clients, notebooks, BI tools, and AI agents.
 
-- **Bring existing models:** Power BI TMDL/DAX, Cube, dbt MetricFlow, LookML, Hex, Rill, Superset, Omni, BSL, GoodData LDM, Snowflake Cortex, Malloy, Apache Ossie, AtScale SML, and ThoughtSpot TML
+- **Bring existing models:** Power BI TMDL/DAX, Cube, dbt MetricFlow, LookML, Hex, Rill, Superset, Omni, BSL, GoodData LDM, Snowflake Cortex, Malloy, Apache Ossie, AtScale SML, ThoughtSpot TML, and Metabase metrics (REST API)
 - **Or author natively:** concise YAML, semantic SQL DDL, or Python
 - **Run on your warehouse:** DuckDB, MotherDuck, PostgreSQL, BigQuery, Snowflake, ClickHouse, Databricks, Spark SQL, and ADBC sources
 - **Consume metrics anywhere:** semantic SQL, CLI, Python, HTTP/Arrow, PostgreSQL wire protocol, MCP, notebooks, TypeScript/WASM, and embedded analytics
@@ -263,7 +263,7 @@ See `examples/` for more.
 
 - SQL query interface with automatic rewriting
 - Automatic joins across models
-- Multi-format adapters (Cube, MetricFlow, LookML, Hex, Rill, Superset, Omni, BSL, GoodData LDM, Apache Ossie, AtScale SML, ThoughtSpot TML, Graphene GSQL)
+- Multi-format adapters (Cube, MetricFlow, LookML, Hex, Rill, Superset, Omni, BSL, GoodData LDM, Apache Ossie, AtScale SML, ThoughtSpot TML, Graphene GSQL, Metabase metrics)
 - SQLGlot-based SQL generation and transpilation
 - Pydantic validation and type safety
 - Pre-aggregations with explicit routing
@@ -276,6 +276,8 @@ See `examples/` for more.
 ## Multi-Format Support
 
 Auto-detects: Sidemantic (SQL/YAML), Power BI TMDL, Cube, MetricFlow (dbt), LookML, Hex, Rill, Superset, Omni, BSL, GoodData LDM, Apache Ossie, AtScale SML, ThoughtSpot TML, Graphene GSQL
+
+Metabase metrics are imported from an instance URL with `MetabaseAdapter` and an API key (`X-Api-Key`). They are not discovered from local files. See [Metabase compatibility](docs/compatibility/metabase.md).
 
 ```bash
 sidemantic query "SELECT revenue FROM orders" --models ./my_models
